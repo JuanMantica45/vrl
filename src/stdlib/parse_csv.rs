@@ -2,6 +2,24 @@ use crate::compiler::prelude::*;
 use quick_csv::Csv;
 use std::io::Cursor;
 
+/// Checks if CSV line ends with a lone quote after delimiter (e.g., `a,"`)
+/// This pattern causes quick-csv to panic in bytes_columns().
+fn ends_with_lone_quote(line: &[u8], delimiter: u8) -> bool {
+    if line.len() >= 2 {
+        let last = line[line.len() - 1];
+        let second_last = line[line.len() - 2];
+        // Pattern: delimiter followed by single quote at end
+        if last == b'"' && second_last == delimiter {
+            return true;
+        }
+    }
+    // Also check if line is just a quote
+    if line.len() == 1 && line[0] == b'"' {
+        return true;
+    }
+    false
+}
+
 fn parse_csv(csv_string: Value, delimiter: Value) -> Resolved {
     let csv_string = csv_string.try_bytes()?;
     let delimiter = delimiter.try_bytes()?;
@@ -9,6 +27,11 @@ fn parse_csv(csv_string: Value, delimiter: Value) -> Resolved {
         return Err("delimiter must be a single character".into());
     }
     let delimiter = delimiter[0];
+
+    // Check for lone trailing quote that causes quick-csv to panic
+    if ends_with_lone_quote(&csv_string, delimiter) {
+        return Err("invalid csv record: A CSV column has an unescaped quote".into());
+    }
 
     let csv = Csv::from_reader(Cursor::new(&*csv_string))
         .delimiter(delimiter);
@@ -248,7 +271,6 @@ mod tests {
            tdef: TypeDef::array(inner_kind()).fallible(),
        }
 
-
        malformed_quotes_unclosed {
            args: func_args![value: value!("field1,\"unclosed quote,field3")],
            want: Ok(value!(["field1", "unclosed quote,field"])),
@@ -288,6 +310,24 @@ mod tests {
        only_quotes {
            args: func_args![value: value!("\"\"")],
            want: Ok(value!([""])),
+           tdef: TypeDef::array(inner_kind()).fallible(),
+       }
+
+       lone_quote_at_end {
+           args: func_args![value: value!("a,\"")],
+           want: Err("invalid csv record: A CSV column has an unescaped quote"),
+           tdef: TypeDef::array(inner_kind()).fallible(),
+       }
+
+       just_a_quote {
+           args: func_args![value: value!("\"")],
+           want: Err("invalid csv record: A CSV column has an unescaped quote"),
+           tdef: TypeDef::array(inner_kind()).fallible(),
+       }
+
+       empty_field_then_lone_quote {
+           args: func_args![value: value!(",\"")],
+           want: Err("invalid csv record: A CSV column has an unescaped quote"),
            tdef: TypeDef::array(inner_kind()).fallible(),
        }
 
