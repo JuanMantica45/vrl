@@ -8,13 +8,32 @@ use serde_json::{
 use crate::compiler::prelude::*;
 use crate::stdlib::json_utils::json_type_def::json_type_def;
 
-fn parse_json(value: Value, lossy: Option<Value>) -> Resolved {
+// In slurp mode: 0 values is an error, 1 unwraps to itself, N collapses to an array.
+fn collapse_slurp(values: Vec<Value>) -> Resolved {
+    match values.len() {
+        0 => Err("unable to parse json: input contains no JSON values".into()),
+        1 => Ok(values.into_iter().next().unwrap()),
+        _ => Ok(Value::from(values)),
+    }
+}
+
+fn parse_json(value: Value, lossy: Option<Value>, slurp: Option<Value>) -> Resolved {
     let lossy = lossy.map(Value::try_boolean).transpose()?.unwrap_or(true);
+    let slurp = slurp.map(Value::try_boolean).transpose()?.unwrap_or(false);
     let bytes = if lossy {
         value.try_bytes_utf8_lossy()?.into_owned().into()
     } else {
         value.try_bytes()?
     };
+
+    if slurp {
+        let mut values = Vec::new();
+        for v in serde_json::Deserializer::from_slice(&bytes).into_iter::<Value>() {
+            values.push(v.map_err(|e| format!("unable to parse json: {e}"))?);
+        }
+        return collapse_slurp(values);
+    }
+
     let value = serde_json::from_slice::<'_, Value>(&bytes)
         .map_err(|e| format!("unable to parse json: {e}"))?;
     Ok(value)
@@ -22,14 +41,31 @@ fn parse_json(value: Value, lossy: Option<Value>) -> Resolved {
 
 // parse_json_with_depth method recursively traverses the value and returns raw JSON-formatted bytes
 // after reaching provided depth.
-fn parse_json_with_depth(value: Value, max_depth: Value, lossy: Option<Value>) -> Resolved {
+fn parse_json_with_depth(
+    value: Value,
+    max_depth: Value,
+    lossy: Option<Value>,
+    slurp: Option<Value>,
+) -> Resolved {
     let parsed_depth = validate_depth(max_depth)?;
     let lossy = lossy.map(Value::try_boolean).transpose()?.unwrap_or(true);
+    let slurp = slurp.map(Value::try_boolean).transpose()?.unwrap_or(false);
     let bytes = if lossy {
         value.try_bytes_utf8_lossy()?.into_owned().into()
     } else {
         value.try_bytes()?
     };
+
+    if slurp {
+        let mut values = Vec::new();
+        for v in serde_json::Deserializer::from_slice(&bytes).into_iter::<Box<RawValue>>() {
+            let raw = v.map_err(|e| format!("unable to read json: {e}"))?;
+            let parsed = parse_layer(&raw, parsed_depth)
+                .map_err(|e| format!("unable to parse json with max depth: {e}"))?;
+            values.push(Value::from(parsed));
+        }
+        return collapse_slurp(values);
+    }
 
     let raw_value = serde_json::from_slice::<'_, &RawValue>(&bytes)
         .map_err(|e| format!("unable to read json: {e}"))?;
@@ -137,6 +173,11 @@ impl Function for ParseJson {
                 kind: kind::BOOLEAN,
                 required: false,
             },
+            Parameter {
+                keyword: "slurp",
+                kind: kind::BOOLEAN,
+                required: false,
+            },
         ]
     }
 
@@ -184,6 +225,16 @@ impl Function for ParseJson {
                 source: r#"parse_json!(s'{"first_level":{"second_level":"finish"}}', max_depth: 1)"#,
                 result: Ok(r#"{"first_level":"{\"second_level\":\"finish\"}"}"#),
             },
+            Example {
+                title: "slurp (multiple values)",
+                source: r#"parse_json!(s'{"a":1}{"b":2}', slurp: true)"#,
+                result: Ok(r#"[{ "a": 1 }, { "b": 2 }]"#),
+            },
+            Example {
+                title: "slurp (single value passes through)",
+                source: r#"parse_json!(s'{"a":1}', slurp: true)"#,
+                result: Ok(r#"{ "a": 1 }"#),
+            },
         ]
     }
 
@@ -196,15 +247,22 @@ impl Function for ParseJson {
         let value = arguments.required("value");
         let max_depth = arguments.optional("max_depth");
         let lossy = arguments.optional("lossy");
+        let slurp = arguments.optional("slurp");
 
         match max_depth {
             Some(max_depth) => Ok(ParseJsonMaxDepthFn {
                 value,
                 max_depth,
                 lossy,
+                slurp,
             }
             .as_expr()),
-            None => Ok(ParseJsonFn { value, lossy }.as_expr()),
+            None => Ok(ParseJsonFn {
+                value,
+                lossy,
+                slurp,
+            }
+            .as_expr()),
         }
     }
 }
@@ -213,17 +271,15 @@ impl Function for ParseJson {
 struct ParseJsonFn {
     value: Box<dyn Expression>,
     lossy: Option<Box<dyn Expression>>,
+    slurp: Option<Box<dyn Expression>>,
 }
 
 impl FunctionExpression for ParseJsonFn {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
         let value = self.value.resolve(ctx)?;
-        let lossy = self
-            .lossy
-            .as_ref()
-            .map(|expr| expr.resolve(ctx))
-            .transpose()?;
-        parse_json(value, lossy)
+        let lossy = self.lossy.as_ref().map(|e| e.resolve(ctx)).transpose()?;
+        let slurp = self.slurp.as_ref().map(|e| e.resolve(ctx)).transpose()?;
+        parse_json(value, lossy, slurp)
     }
 
     fn type_def(&self, _: &state::TypeState) -> TypeDef {
@@ -236,18 +292,16 @@ struct ParseJsonMaxDepthFn {
     value: Box<dyn Expression>,
     max_depth: Box<dyn Expression>,
     lossy: Option<Box<dyn Expression>>,
+    slurp: Option<Box<dyn Expression>>,
 }
 
 impl FunctionExpression for ParseJsonMaxDepthFn {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
         let value = self.value.resolve(ctx)?;
         let max_depth = self.max_depth.resolve(ctx)?;
-        let lossy = self
-            .lossy
-            .as_ref()
-            .map(|expr| expr.resolve(ctx))
-            .transpose()?;
-        parse_json_with_depth(value, max_depth, lossy)
+        let lossy = self.lossy.as_ref().map(|e| e.resolve(ctx)).transpose()?;
+        let slurp = self.slurp.as_ref().map(|e| e.resolve(ctx)).transpose()?;
+        parse_json_with_depth(value, max_depth, lossy, slurp)
     }
 
     fn type_def(&self, _: &state::TypeState) -> TypeDef {
@@ -369,4 +423,126 @@ mod tests {
             tdef: json_type_def(),
         }
     ];
+
+    // Multi-line, concatenated, NDJSON, and slurp-mode behavior in one table.
+    // For errors, the value is a substring the message must contain.
+    #[test]
+    fn parse_json_cases() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            slurp: bool,
+            max_depth: Option<i64>,
+            expected: Result<Value, &'static str>,
+        }
+
+        let cases: Vec<Case> = vec![
+            // ----- strict mode: documents that parse cleanly -----
+            Case { name: "multiline_object", slurp: false, max_depth: None,
+                input: "{\n  \"field\": \"value\",\n  \"num\": 42\n}",
+                expected: Ok(value!({ field: "value", num: 42 })) },
+            Case { name: "multiline_array", slurp: false, max_depth: None,
+                input: "[\n  1,\n  2,\n  3\n]",
+                expected: Ok(value!([1, 2, 3])) },
+            Case { name: "multiline_nested", slurp: false, max_depth: None,
+                input: "{\n  \"arr\": [1, 2],\n  \"obj\": { \"x\": true }\n}",
+                expected: Ok(value!({ arr: [1, 2], obj: { x: true } })) },
+            Case { name: "leading_trailing_whitespace", slurp: false, max_depth: None,
+                input: "  \n\t  {\"a\": 1}  \n  ",
+                expected: Ok(value!({ a: 1 })) },
+            Case { name: "escaped_newline_in_string", slurp: false, max_depth: None,
+                input: r#"{"text":"line1\nline2"}"#,
+                expected: Ok(value!({ text: "line1\nline2" })) },
+
+            // ----- strict mode: rejected (multiple values or invalid) -----
+            Case { name: "concatenated_no_separator", slurp: false, max_depth: None,
+                input: r#"{"a":1}{"b":2}"#,
+                expected: Err("trailing characters at line 1 column 8") },
+            Case { name: "ndjson_default", slurp: false, max_depth: None,
+                input: "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n",
+                expected: Err("trailing characters at line 2 column 1") },
+            Case { name: "literal_newline_in_string", slurp: false, max_depth: None,
+                input: "{\"text\":\"line1\nline2\"}",
+                expected: Err("control character (\\u0000-\\u001F)") },
+            Case { name: "empty_input", slurp: false, max_depth: None,
+                input: "",
+                expected: Err("EOF while parsing a value at line 1 column 0") },
+            Case { name: "whitespace_only", slurp: false, max_depth: None,
+                input: "  \n  \t  ",
+                expected: Err("EOF while parsing a value at line 2 column 5") },
+
+            // ----- slurp: multi-value inputs collapsed to an array -----
+            Case { name: "slurp_concatenated", slurp: true, max_depth: None,
+                input: r#"{"a":1}{"b":2}"#,
+                expected: Ok(value!([{ a: 1 }, { b: 2 }])) },
+            Case { name: "slurp_ndjson", slurp: true, max_depth: None,
+                input: "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n",
+                expected: Ok(value!([{ a: 1 }, { b: 2 }, { c: 3 }])) },
+            Case { name: "slurp_mixed_values", slurp: true, max_depth: None,
+                input: r#"{"a":1}[1,2]"hello"42"#,
+                expected: Ok(value!([{ a: 1 }, [1, 2], "hello", 42])) },
+
+            // ----- slurp: single value passes through unwrapped (incl. arrays) -----
+            Case { name: "slurp_single_object_unwrapped", slurp: true, max_depth: None,
+                input: r#"{"a":1}"#,
+                expected: Ok(value!({ a: 1 })) },
+            Case { name: "slurp_single_array_unwrapped", slurp: true, max_depth: None,
+                input: r#"[1,2,3]"#,
+                expected: Ok(value!([1, 2, 3])) },
+
+            // ----- slurp: errors -----
+            Case { name: "slurp_trailing_garbage", slurp: true, max_depth: None,
+                input: r#"{"a":1} not_json"#,
+                expected: Err("expected ident at line 1 column 10") },
+            Case { name: "slurp_empty", slurp: true, max_depth: None,
+                input: "",
+                expected: Err("input contains no JSON values") },
+            Case { name: "slurp_whitespace_only", slurp: true, max_depth: None,
+                input: "  \n\t  ",
+                expected: Err("input contains no JSON values") },
+            Case { name: "slurp_false_is_strict", slurp: false, max_depth: None,
+                input: r#"{"a":1}{"b":2}"#,
+                expected: Err("trailing characters at line 1 column 8") },
+
+            // ----- slurp + max_depth (each value depth-limited individually) -----
+            Case { name: "slurp_with_max_depth", slurp: true, max_depth: Some(1),
+                input: r#"{"top":{"inner":1}}{"top":{"inner":2}}"#,
+                expected: Ok(value!([
+                    { top: r#"{"inner":1}"# },
+                    { top: r#"{"inner":2}"# },
+                ])) },
+            Case { name: "slurp_with_max_depth_single", slurp: true, max_depth: Some(1),
+                input: r#"{"top":{"inner":1}}"#,
+                expected: Ok(value!({ top: r#"{"inner":1}"# })) },
+        ];
+
+        for c in cases {
+            let value = Value::from(c.input);
+            let slurp = c.slurp.then(|| Value::from(true));
+            let result = match c.max_depth {
+                Some(d) => parse_json_with_depth(value, Value::from(d), None, slurp),
+                None => parse_json(value, None, slurp),
+            };
+            match (c.expected, result) {
+                (Ok(want), Ok(got)) => assert_eq!(
+                    got, want,
+                    "case `{}`: value mismatch", c.name,
+                ),
+                (Err(want_substr), Err(got)) => {
+                    let got_msg = got.to_string();
+                    assert!(
+                        got_msg.contains(want_substr),
+                        "case `{}`: error mismatch\n  want substring: {:?}\n  got: {:?}",
+                        c.name, want_substr, got_msg,
+                    );
+                }
+                (Ok(want), Err(got)) => panic!(
+                    "case `{}`: expected Ok({want:?}), got Err({got})", c.name,
+                ),
+                (Err(want), Ok(got)) => panic!(
+                    "case `{}`: expected Err containing {want:?}, got Ok({got:?})", c.name,
+                ),
+            }
+        }
+    }
 }
