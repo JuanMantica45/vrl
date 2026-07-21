@@ -1,5 +1,63 @@
 use crate::compiler::prelude::*;
-use std::io::Cursor;
+use csv_core::{ReadRecordResult, Reader as CsvReader, ReaderBuilder};
+use std::cell::RefCell;
+
+thread_local! {
+    // Building a csv_core DFA dominates the cost of parsing one short row, so we
+    // cache one reader per delimiter and reuse it (reset) across calls.
+    static READERS: RefCell<Vec<(u8, CsvReader)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Parse the first CSV record of `input` into its byte fields.
+///
+/// We drive `csv_core` directly so the DFA can be reused across calls and the
+/// input slice fed without a `BufReader` copy. The read loop below mirrors the
+/// `csv` crate's `Reader::read_byte_record_impl` (same `read_record` cursor /
+/// `OutputFull` / `OutputEndsFull` accumulator pattern) — the reference to
+/// check this against:
+///   - csv crate loop: <https://github.com/BurntSushi/rust-csv/blob/1.3.1/src/reader.rs#L1619> (`read_byte_record_impl`)
+///   - csv_core primitive: <https://docs.rs/csv-core/0.1.11/csv_core/struct.Reader.html#method.read_record>
+///
+/// `csv_core` never errors — it always prefers *a* parse over none.
+fn parse_first_record(input: &[u8], delimiter: u8) -> Vec<Value> {
+    READERS.with_borrow_mut(|readers| {
+        let reader = match readers.iter().position(|(d, _)| *d == delimiter) {
+            Some(i) => &mut readers[i].1,
+            None => {
+                readers.push((delimiter, ReaderBuilder::new().delimiter(delimiter).build()));
+                &mut readers.last_mut().unwrap().1
+            }
+        };
+        reader.reset();
+
+        // Unescaping never lengthens a field, so the record fits in `input.len()`.
+        let mut output = vec![0u8; input.len()];
+        let mut ends = vec![0usize; 64];
+        let (mut nin, mut nout, mut nend) = (0usize, 0usize, 0usize);
+        loop {
+            let (result, in_read, out_written, ends_written) =
+                reader.read_record(&input[nin..], &mut output[nout..], &mut ends[nend..]);
+            nin += in_read;
+            nout += out_written;
+            nend += ends_written;
+            match result {
+                ReadRecordResult::Record | ReadRecordResult::End => break,
+                // Final field had no trailing terminator; flush it with empty input.
+                ReadRecordResult::InputEmpty => {}
+                ReadRecordResult::OutputFull => output.resize(output.len() * 2, 0),
+                ReadRecordResult::OutputEndsFull => ends.resize(ends.len() * 2, 0),
+            }
+        }
+
+        let mut fields = Vec::with_capacity(nend);
+        let mut start = 0;
+        for &end in &ends[..nend] {
+            fields.push(Bytes::copy_from_slice(&output[start..end]).into());
+            start = end;
+        }
+        fields
+    })
+}
 
 fn parse_csv(csv_string: Value, delimiter: Value) -> Resolved {
     let csv_string = csv_string.try_bytes()?;
@@ -9,22 +67,7 @@ fn parse_csv(csv_string: Value, delimiter: Value) -> Resolved {
     }
     let delimiter = delimiter[0];
 
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .delimiter(delimiter)
-        .flexible(true)
-        .from_reader(Cursor::new(&*csv_string));
-
-    let mut record = csv::ByteRecord::new();
-    match reader.read_byte_record(&mut record) {
-        Ok(true) => Ok(record
-            .iter()
-            .map(|field| Bytes::copy_from_slice(field).into())
-            .collect::<Vec<Value>>()
-            .into()),
-        Ok(false) => Ok(Vec::<Value>::new().into()),
-        Err(err) => Err(format!("invalid csv record: {err}").into()),
-    }
+    Ok(parse_first_record(&csv_string, delimiter).into())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -100,6 +143,125 @@ fn inner_kind() -> Collection<Index> {
 mod tests {
     use super::*;
     use crate::value;
+
+    /// Parse the first record exactly as the previous `csv`-crate implementation
+    /// did, to use as a differential oracle against our `csv_core` parser.
+    fn csv_crate_oracle(input: &[u8], delimiter: u8) -> Vec<Value> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .delimiter(delimiter)
+            .flexible(true)
+            .from_reader(std::io::Cursor::new(input));
+        let mut record = csv::ByteRecord::new();
+        match reader.read_byte_record(&mut record) {
+            Ok(true) => record
+                .iter()
+                .map(|f| Bytes::copy_from_slice(f).into())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn matches_csv_crate_on_edge_cases() {
+        let cases: &[(&[u8], u8)] = &[
+            (b"", b','),
+            (b"foo", b','),
+            (b"foo,bar", b','),
+            (b"foo,bar\n", b','),
+            (b"foo,bar\r\n", b','),
+            (b"a,b\nc,d", b','),                  // only first record
+            (b"\n", b','),                        // empty line
+            (b"\r\n", b','),
+            (b",,,", b','),                       // empty fields
+            (b"a,b,", b','),                      // trailing empty field
+            (b"\"\"", b','),                      // empty quoted field
+            (b"\"\"\"\"", b','),                  // escaped quote only
+            (b"\"a,b\",c", b','),                 // quoted comma
+            (b"\"a\"\"b\",c", b','),              // escaped quote inside field
+            (b"a\"b,c", b','),                    // lenient: quote mid-field
+            (b"\"unterminated,c", b','),          // unterminated quote
+            (b"\xEF\xBB\xBFfoo,bar", b','),       // leading UTF-8 BOM
+            (b"foo,b\xFFar", b','),               // invalid UTF-8 bytes
+            (b" a , b ", b','),                   // surrounding whitespace
+            (b"a,\"b\nc\",d", b','),              // newline inside quotes
+            (b"a\rb", b','),                      // bare carriage return
+            (b"x\ty\tz", b'\t'),                  // tab delimiter
+            (b"x|y|z", b'|'),                     // pipe delimiter
+            (b"\"a\tb\",c", b'\t'),               // quoted tab with tab delimiter
+        ];
+        // Driven through the shared thread-local reader cache (including
+        // delimiter switches), so any stale state carried across calls by
+        // `reset()` or the per-delimiter cache would be caught here.
+        for &(input, delimiter) in cases {
+            let ours = parse_first_record(input, delimiter);
+            let oracle = csv_crate_oracle(input, delimiter);
+            assert_eq!(
+                ours,
+                oracle,
+                "mismatch for input {:?} (delimiter {:?})",
+                String::from_utf8_lossy(input),
+                delimiter as char,
+            );
+        }
+    }
+
+    // The loop's only exit is `Record | End`. These cases never take that arm on
+    // the first `read_record`, exercising the `continue` arms instead, and prove
+    // the loop still terminates correctly.
+
+    #[test]
+    fn unterminated_record_exits_via_input_empty_then_record() {
+        // No trailing terminator: first read returns `InputEmpty` (input
+        // exhausted mid-record); the next iteration feeds the now-empty slice,
+        // which csv_core finalizes to `Record`.
+        for input in [&b"a,b,c"[..], b"single", b"\"quoted\"", b"trailing,"] {
+            assert_eq!(parse_first_record(input, b','), csv_crate_oracle(input, b','));
+        }
+    }
+
+    #[test]
+    fn many_fields_exit_via_ends_growth_then_record() {
+        // `ends` starts at 64, so >64 fields force the `OutputEndsFull` arm: the
+        // loop grows `ends` and continues, still leaving only via `Record`.
+        for n in [1usize, 63, 64, 65, 200, 1000] {
+            let input = (0..n)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes();
+            let ours = parse_first_record(&input, b',');
+            assert_eq!(ours.len(), n, "field count for n={n}");
+            assert_eq!(ours, csv_crate_oracle(&input, b','), "mismatch for n={n}");
+        }
+    }
+
+    // Backstop for the thread-local invariant. An `async` block's future is
+    // `Send` only if every value held across an `.await` is `Send` (see the Rust
+    // async book, "Send approximation"). Here `parsed` is held across the await,
+    // so this compiles only while `parse_csv`'s result is `Send`. If a refactor
+    // made it return a `!Send` value leaked from the cache — e.g. a `RefCell`
+    // guard, since `impl !Send for RefMut` (std docs) — this block becomes
+    // `!Send` and `assert_send` fails to compile.
+    //
+    // This is a backstop, not the primary guarantee. The real safety is
+    // structural: `parse_csv` is a synchronous `fn` (so `.await` cannot appear
+    // inside it) and `with_borrow_mut` confines the borrow to a synchronous
+    // closure returning owned data, so a cache borrow can never reach an
+    // `.await`. (A plain `&[u8]` into the cache *is* `Send` and would slip past
+    // this test — but `with_borrow_mut` makes such an escaping borrow
+    // inexpressible without `unsafe`.)
+    #[test]
+    fn parse_csv_result_is_send_across_await() {
+        fn assert_send<F: core::future::Future + Send>(f: F) -> F {
+            f
+        }
+        let _guard = assert_send(async {
+            let parsed = parse_csv(value!("a,b,c"), value!(","));
+            core::future::ready(()).await;
+            drop(parsed);
+        });
+    }
 
     test_function![
         parse_csv => ParseCsv;
