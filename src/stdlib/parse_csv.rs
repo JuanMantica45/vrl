@@ -236,6 +236,33 @@ mod tests {
         }
     }
 
+    // Backstop for the thread-local invariant. An `async` block's future is
+    // `Send` only if every value held across an `.await` is `Send` (see the Rust
+    // async book, "Send approximation"). Here `parsed` is held across the await,
+    // so this compiles only while `parse_csv`'s result is `Send`. If a refactor
+    // made it return a `!Send` value leaked from the cache — e.g. a `RefCell`
+    // guard, since `impl !Send for RefMut` (std docs) — this block becomes
+    // `!Send` and `assert_send` fails to compile.
+    //
+    // This is a backstop, not the primary guarantee. The real safety is
+    // structural: `parse_csv` is a synchronous `fn` (so `.await` cannot appear
+    // inside it) and `with_borrow_mut` confines the borrow to a synchronous
+    // closure returning owned data, so a cache borrow can never reach an
+    // `.await`. (A plain `&[u8]` into the cache *is* `Send` and would slip past
+    // this test — but `with_borrow_mut` makes such an escaping borrow
+    // inexpressible without `unsafe`.)
+    #[test]
+    fn parse_csv_result_is_send_across_await() {
+        fn assert_send<F: core::future::Future + Send>(f: F) -> F {
+            f
+        }
+        let _guard = assert_send(async {
+            let parsed = parse_csv(value!("a,b,c"), value!(","));
+            core::future::ready(()).await;
+            drop(parsed);
+        });
+    }
+
     test_function![
         parse_csv => ParseCsv;
 
