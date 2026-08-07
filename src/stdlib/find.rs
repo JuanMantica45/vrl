@@ -3,7 +3,7 @@ use crate::compiler::prelude::*;
 #[allow(clippy::cast_possible_wrap)]
 fn find(value: Value, pattern: Value, from: Option<Value>) -> Resolved {
     let from = match from {
-        Some(value) => value.try_integer()?,
+        Some(value) => value.try_integer()?.max(0),
         None => 0,
     } as usize;
 
@@ -75,6 +75,9 @@ struct FindFn {
 
 impl FindFn {
     fn find_regex_in_str(value: &str, regex: ValueRegex, offset: usize) -> Option<usize> {
+        if offset > value.len() {
+            return None;
+        }
         regex.find_at(value, offset).map(|found| found.start())
     }
 
@@ -176,6 +179,25 @@ mod tests {
         wrong_pattern {
             args: func_args![value: "foobar", pattern: Value::Integer(42)],
             want: Err("expected string or regex, got integer"),
+            tdef: TypeDef::integer().infallible(),
+        }
+
+        // OBE-10722: negative from wraps to huge usize, panics in regex::find_at
+        negative_from_string {
+            args: func_args![value: "foobar", pattern: "bar", from: -1_i64],
+            want: Ok(value!(3)),
+            tdef: TypeDef::integer().infallible(),
+        }
+
+        negative_from_regex {
+            args: func_args![value: "foobar", pattern: Value::Regex(Regex::new("bar").unwrap().into()), from: -10_i64],
+            want: Ok(value!(3)),
+            tdef: TypeDef::integer().infallible(),
+        }
+
+        from_past_end {
+            args: func_args![value: "foobar", pattern: Value::Regex(Regex::new("bar").unwrap().into()), from: 100_i64],
+            want: Ok(value!(-1)),
             tdef: TypeDef::integer().infallible(),
         }
     ];

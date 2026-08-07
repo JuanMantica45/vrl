@@ -1,6 +1,5 @@
 #![deny(clippy::arithmetic_side_effects)]
 
-use std::ops::{Add, Mul, Rem};
 
 use crate::compiler::{
     value::{Kind, VrlValueConvert},
@@ -68,6 +67,33 @@ fn safe_sub(lhv: f64, rhv: f64) -> Option<Value> {
     }
 }
 
+fn safe_add(lhv: f64, rhv: f64) -> Option<Value> {
+    let result = lhv + rhv;
+    if result.is_nan() {
+        None
+    } else {
+        Some(Value::from_f64_or_zero(result))
+    }
+}
+
+fn safe_mul(lhv: f64, rhv: f64) -> Option<Value> {
+    let result = lhv * rhv;
+    if result.is_nan() {
+        None
+    } else {
+        Some(Value::from_f64_or_zero(result))
+    }
+}
+
+fn safe_rem(lhv: f64, rhv: f64) -> Option<Value> {
+    let result = lhv % rhv;
+    if result.is_nan() {
+        None
+    } else {
+        Some(Value::from_f64_or_zero(result))
+    }
+}
+
 impl VrlValueArithmetic for Value {
     /// Similar to [`std::ops::Mul`], but fallible (e.g. `TryMul`).
     fn try_mul(self, rhs: Self) -> Result<Self, ValueError> {
@@ -90,7 +116,7 @@ impl VrlValueArithmetic for Value {
             }
             Value::Float(lhv) => {
                 let rhs = rhs.try_into_f64().map_err(|_| err())?;
-                lhv.mul(rhs).into()
+                safe_mul(*lhv, rhs).ok_or_else(err)?
             }
             Value::Bytes(lhv) if rhs.is_integer() => {
                 Bytes::from(lhv.repeat(as_usize(rhs.try_integer()?))).into()
@@ -134,7 +160,8 @@ impl VrlValueArithmetic for Value {
                 let rhs = rhs
                     .try_into_f64()
                     .map_err(|_| ValueError::Add(Kind::float(), rhs.kind()))?;
-                lhs.add(rhs).into()
+                safe_add(*lhs, rhs)
+                    .ok_or(ValueError::Add(Kind::float(), Kind::float()))?
             }
             (lhs @ Value::Bytes(_), Value::Null) => lhs,
             (Value::Bytes(lhs), Value::Bytes(rhs)) => {
@@ -230,7 +257,7 @@ impl VrlValueArithmetic for Value {
             }
             Value::Float(lhv) => {
                 let rhv = rhs.try_into_f64().map_err(|_| err())?;
-                lhv.rem(rhv).into()
+                safe_rem(*lhv, rhv).ok_or_else(err)?
             }
             _ => return Err(err()),
         };

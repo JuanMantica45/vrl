@@ -162,22 +162,25 @@ fn process_node(node: Node, config: &ParseXmlConfig) -> Value {
                 _ => match node.children().count() {
                     // For a single node, 'flatten' the object if necessary.
                     1 => {
-                        // Expect a single element.
-                        let node = node.children().next().expect("expected 1 XML node");
+                        // Skip non-element/non-text nodes (e.g. comments, PIs) to prevent
+                        // passing them to process_node which cannot handle them.
+                        let child = node
+                            .children()
+                            .find(|n| n.is_element() || n.is_text());
+                        match child {
+                            Some(node) if node.is_element() => {
+                                let mut map = BTreeMap::new();
 
-                        // If the node is an element, treat it as an object.
-                        if node.is_element() {
-                            let mut map = BTreeMap::new();
+                                map.insert(
+                                    node.tag_name().name().to_string().into(),
+                                    process_node(node, config),
+                                );
 
-                            map.insert(
-                                node.tag_name().name().to_string().into(),
-                                process_node(node, config),
-                            );
-
-                            Value::Object(map)
-                        } else {
-                            // Otherwise, 'flatten' the object by continuing processing.
-                            process_node(node, config)
+                                Value::Object(map)
+                            }
+                            Some(node) => process_node(node, config),
+                            // Only child is a comment or PI — treat as empty element.
+                            None => Value::Object(recurse(node)),
                         }
                     }
                     // For 2+ nodes, expand.
