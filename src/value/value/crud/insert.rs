@@ -26,10 +26,11 @@ pub fn insert<'a, T: ValueCollection>(
             if let Some(Value::Array(array)) = value.get_mut_value(key.borrow()) {
                 insert(array, index, path_iter, insert_value)
             } else {
+                const MAX_ARRAY_CAPACITY: usize = 32_769;
                 let capacity = if index >= 0 {
-                    (index as usize) + 1
+                    ((index as usize) + 1).min(MAX_ARRAY_CAPACITY)
                 } else {
-                    (-index) as usize
+                    ((-index) as usize).min(MAX_ARRAY_CAPACITY)
                 };
                 let mut array = Vec::with_capacity(capacity);
                 let prev_value = insert(&mut array, index, path_iter, insert_value);

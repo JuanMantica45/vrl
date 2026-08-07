@@ -9,7 +9,8 @@ fn format_number(
 ) -> Resolved {
     let value: Decimal = match value {
         Value::Integer(v) => v.into(),
-        Value::Float(v) => Decimal::from_f64(*v).expect("not NaN"),
+        Value::Float(v) => Decimal::from_f64(*v)
+            .ok_or("cannot convert float to decimal: value is infinite or out of range")?,
         value => {
             return Err(ValueError::Expected {
                 got: value.kind(),
@@ -39,8 +40,14 @@ fn format_number(
     debug_assert!(parts.len() <= 2);
     // Manipulate fractional part based on configuration.
     match scale {
+        Some(i) if i < 0 => {
+            return Err(format!("scale must be non-negative, got {i}").into());
+        }
         Some(0) => parts.truncate(1),
         Some(i) => {
+            if i > 1024 {
+                return Err(format!("scale must not exceed 1024, got {i}").into());
+            }
             let i = i as usize;
 
             if parts.len() == 1 {
@@ -173,7 +180,7 @@ impl FunctionExpression for FormatNumberFn {
     }
 
     fn type_def(&self, _: &state::TypeState) -> TypeDef {
-        TypeDef::bytes().infallible()
+        TypeDef::bytes().fallible()
     }
 }
 
@@ -188,14 +195,14 @@ mod tests {
         number {
             args: func_args![value: 1234.567],
             want: Ok(value!("1234.567")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
         precision {
             args: func_args![value: 1234.567,
                              scale: 2],
             want: Ok(value!("1234.56")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
 
@@ -204,7 +211,7 @@ mod tests {
                              scale: 2,
                              decimal_separator: ","],
             want: Ok(value!("1234,56")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
         more_separators {
@@ -213,7 +220,7 @@ mod tests {
                              decimal_separator: ",",
                              grouping_separator: " "],
             want: Ok(value!("1 234,56")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
         big_number {
@@ -222,34 +229,66 @@ mod tests {
                              decimal_separator: ",",
                              grouping_separator: "."],
             want: Ok(value!("11.222.333.444,567")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
         integer {
             args: func_args![value: 100.0],
             want: Ok(value!("100")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
         integer_decimals {
             args: func_args![value: 100.0,
                              scale: 2],
             want: Ok(value!("100.00")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
         float_no_decimals {
             args: func_args![value: 123.45,
                              scale: 0],
             want: Ok(value!("123")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
         }
 
         integer_no_decimals {
             args: func_args![value: 12345,
                              scale: 2],
             want: Ok(value!("12345.00")),
-            tdef: TypeDef::bytes().infallible(),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        // OBE-10723: panic on ±∞ (float not representable as Decimal)
+        float_infinity {
+            args: func_args![value: f64::INFINITY],
+            want: Err("cannot convert float to decimal: value is infinite or out of range"),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        float_neg_infinity {
+            args: func_args![value: f64::NEG_INFINITY],
+            want: Err("cannot convert float to decimal: value is infinite or out of range"),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        // OBE-10724: OOM / panic on negative or huge scale
+        negative_scale {
+            args: func_args![value: 1.0, scale: -1_i64],
+            want: Err("scale must be non-negative, got -1"),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        excessive_scale {
+            args: func_args![value: 1.0, scale: 1025_i64],
+            want: Err("scale must not exceed 1024, got 1025"),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        max_allowed_scale {
+            args: func_args![value: 1.5, scale: 3_i64],
+            want: Ok(value!("1.500")),
+            tdef: TypeDef::bytes().fallible(),
         }
     ];
 }

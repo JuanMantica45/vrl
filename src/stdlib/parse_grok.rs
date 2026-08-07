@@ -10,8 +10,11 @@ mod non_wasm {
 
     fn parse_grok(value: Value, pattern: Arc<grok::Pattern>) -> Resolved {
         let bytes = value.try_bytes_utf8_lossy()?;
-        match pattern.match_against(&bytes) {
-            Some(matches) => {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pattern.match_against(&bytes)
+        }));
+        match result {
+            Ok(Some(matches)) => {
                 let mut result = BTreeMap::new();
 
                 for (name, value) in &matches {
@@ -20,7 +23,8 @@ mod non_wasm {
 
                 Ok(Value::from(result))
             }
-            None => Err("unable to parse input with grok pattern".into()),
+            Ok(None) => Err("unable to parse input with grok pattern".into()),
+            Err(_) => Err("grok pattern match failed: regex engine error".into()),
         }
     }
 

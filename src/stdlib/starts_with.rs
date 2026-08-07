@@ -23,6 +23,12 @@ impl Iterator for Chars<'_> {
         if width == 1 {
             self.pos += 1;
             Some(Ok(self.bytes[self.pos - 1] as char))
+        } else if width == 0 || self.pos + width > self.bytes.len() {
+            // Invalid lead byte (width==0 for continuation/forbidden bytes) or truncated
+            // multi-byte sequence: yield the raw byte as an error and advance by one.
+            let byte = self.bytes[self.pos];
+            self.pos += 1;
+            Some(Err(byte))
         } else {
             let c = std::str::from_utf8(&self.bytes[self.pos..self.pos + width]);
             match c {
@@ -31,8 +37,9 @@ impl Iterator for Chars<'_> {
                     Some(Ok(chr.chars().next().unwrap()))
                 }
                 Err(_) => {
+                    let byte = self.bytes[self.pos];
                     self.pos += 1;
-                    Some(Err(self.bytes[self.pos]))
+                    Some(Err(byte))
                 }
             }
         }
@@ -165,6 +172,7 @@ impl FunctionExpression for StartsWithFn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     test_function![
         starts_with => StartsWith;
@@ -267,6 +275,25 @@ mod tests {
                              case_sensitive: false
             ],
             want: Ok(true),
+            tdef: TypeDef::boolean().infallible(),
+        }
+
+        // OBE-10733: stray continuation byte (0x80) causes width==0 → panic without the fix
+        invalid_utf8_lead_byte_case_insensitive {
+            args: func_args![value: Value::Bytes(Bytes::from(vec![0x80u8, b'a', b'b', b'c'])),
+                             substring: "abc",
+                             case_sensitive: false
+            ],
+            want: Ok(false),
+            tdef: TypeDef::boolean().infallible(),
+        }
+
+        invalid_utf8_truncated_multibyte {
+            args: func_args![value: Value::Bytes(Bytes::from(vec![0xc3u8])),
+                             substring: "a",
+                             case_sensitive: false
+            ],
+            want: Ok(false),
             tdef: TypeDef::boolean().infallible(),
         }
     ];
