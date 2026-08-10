@@ -56,6 +56,9 @@ pub struct Compiler<'a> {
     // the error from the LHS)
     fallible_expression_error: Option<CompilerError>,
 
+    /// Current expression nesting depth, incremented on each compile_expr entry.
+    depth: u32,
+
     config: CompileConfig,
 }
 
@@ -102,6 +105,7 @@ impl<'a> Compiler<'a> {
             external_assignments: vec![],
             skip_missing_query_target: vec![],
             fallible_expression_error: None,
+            depth: 0,
             config,
         };
         let expressions = compiler.compile_root_exprs(ast, &mut state);
@@ -148,7 +152,27 @@ impl<'a> Compiler<'a> {
         Some(exprs)
     }
 
+    const MAX_EXPR_DEPTH: u32 = 128;
+
     fn compile_expr(&mut self, node: Node<ast::Expr>, state: &mut TypeState) -> Option<Expr> {
+        if self.depth >= Self::MAX_EXPR_DEPTH {
+            self.diagnostics.push(Box::new(ExpressionError::Error {
+                message: format!(
+                    "expression nesting depth limit ({}) exceeded",
+                    Self::MAX_EXPR_DEPTH
+                ),
+                labels: vec![],
+                notes: vec![],
+            }));
+            return None;
+        }
+        self.depth += 1;
+        let result = self.compile_expr_inner(node, state);
+        self.depth -= 1;
+        result
+    }
+
+    fn compile_expr_inner(&mut self, node: Node<ast::Expr>, state: &mut TypeState) -> Option<Expr> {
         use ast::Expr::{
             Abort, Assignment, Container, FunctionCall, IfStatement, Literal, Op, Query, Return,
             Unary, Variable,
@@ -850,5 +874,35 @@ impl<'a> Compiler<'a> {
         };
 
         self.skip_missing_query_target.push(query);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_expression_depth_limit_obe10738() {
+        // OBE-10738: VRL programs with expression nesting > MAX_EXPR_DEPTH must be rejected at
+        // compile time.  Without the fix, the compiler recurses once per expression level and can
+        // stack overflow on crafted programs.
+        //
+        // We spawn with a larger stack because the VRL parser itself is recursive and overflows the
+        // default thread stack before the compiler's depth check can fire. 32 MB is enough for the
+        // parser to survive 130 levels while the compiler rejects at MAX_EXPR_DEPTH (128).
+        //
+        // With fix: compiler catches at depth 128 → Err.
+        // Without fix: compiler recurses 130 times and returns Ok → assertion fails.
+        let depth = 130usize;
+        let is_err = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                let open: String = "if true { ".repeat(depth);
+                let close: String = " }".repeat(depth);
+                let program = format!("{open}1{close}");
+                crate::compiler::compile(&program, &crate::stdlib::all()).is_err()
+            })
+            .expect("thread spawn failed")
+            .join()
+            .expect("thread panicked");
+        assert!(is_err, "program with {depth} nested if-blocks must fail compilation (OBE-10738)");
     }
 }

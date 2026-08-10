@@ -1,9 +1,19 @@
 use crate::compiler::prelude::*;
 use crate::path::{OwnedSegment, OwnedValuePath};
 
+const MAX_PATH_SEGMENTS: usize = 128;
+
 fn set(path: Value, mut value: Value, data: Value) -> Resolved {
     let path = match path {
         Value::Array(segments) => {
+            if segments.len() > MAX_PATH_SEGMENTS {
+                return Err(format!(
+                    "path has {} segments, max is {MAX_PATH_SEGMENTS}",
+                    segments.len()
+                )
+                .into());
+            }
+
             let mut insert = OwnedValuePath::root();
 
             for segment in segments {
@@ -186,4 +196,15 @@ mod tests {
             tdef: TypeDef::object(Collection::any()).fallible(),
         }
     ];
+
+    #[test]
+    fn test_path_length_limit_obe10739() {
+        // OBE-10739: attacker-controlled path with > MAX_PATH_SEGMENTS segments must be rejected.
+        // Without the fix this returns Ok and accepts arbitrary-depth writes.
+        let segments: Vec<Value> = (0..200).map(|i| Value::Bytes(format!("k{i}").into())).collect();
+        let result = set(Value::Array(segments), Value::Object(ObjectMap::new()), Value::Null);
+        assert!(result.is_err(), "path with 200 segments must be rejected (OBE-10739)");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("200 segments"), "error should name the count: {msg}");
+    }
 }
