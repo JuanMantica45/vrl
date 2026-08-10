@@ -78,6 +78,32 @@ mod test {
         assert_eq!(value, expected);
     }
 
+    // OBE-10735: `insert_value` padded the array with `Value::Null` up to an arbitrary index,
+    // and `Vec::with_capacity(index + 1)` allocated for it up front — an event-controlled path
+    // index was enough to exhaust memory.
+    #[test]
+    fn test_insert_beyond_max_array_index_is_rejected() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[40000]", 1), None);
+        assert_eq!(value, Value::from(json!([])));
+    }
+
+    #[test]
+    fn test_insert_beyond_max_negative_array_index_is_rejected() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[-40000]", 1), None);
+        assert_eq!(value, Value::from(json!([])));
+    }
+
+    #[test]
+    fn test_insert_at_max_array_index_is_allowed() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[32768]", 1), None);
+        let array = value.as_array().expect("expected an array");
+        assert_eq!(array.len(), 32769);
+        assert_eq!(array[32768], Value::Integer(1));
+    }
+
     #[test]
     fn test_insert_negative_index() {
         let mut value = Value::Null;

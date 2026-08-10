@@ -483,9 +483,24 @@ mod tests {
             tdef: type_def(),
         }
 
+        // OBE-10731: an element whose only child is a comment or processing instruction took
+        // the single-child "flatten" path, handing a non-element/non-text node to
+        // `process_node`, which hits `unreachable!("shouldn't be other XML nodes")`.
+        only_child_is_a_comment {
+            args: func_args![ value: "<a><!-- comment --></a>"],
+            want: Ok(value!({ "a": {} })),
+            tdef: type_def(),
+        }
+
         // OBE-10731: element whose sole child is a PI must not panic
         pi_only_child {
             args: func_args![value: "<a><?pi?></a>"],
+            want: Ok(value!({ "a": {} })),
+            tdef: type_def(),
+        }
+
+        only_child_is_a_processing_instruction {
+            args: func_args![ value: "<a><?target data?></a>"],
             want: Ok(value!({ "a": {} })),
             tdef: type_def(),
         }

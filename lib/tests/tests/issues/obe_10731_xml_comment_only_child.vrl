@@ -1,0 +1,6 @@
+# issue: OBE-10731
+# An element whose only child is a comment took the single-child "flatten" path and handed the
+# comment node to `process_node`, hitting `unreachable!("shouldn't be other XML nodes")`.
+# result: { "a": {} }
+
+parse_xml!("<a><!-- comment --></a>")
