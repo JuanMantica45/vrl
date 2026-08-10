@@ -105,7 +105,7 @@ impl ValueCollection for Vec<Value> {
 
     fn insert_value(&mut self, key: isize, value: Value) -> Option<Value> {
         const MAX_ARRAY_INDEX: isize = 32_768;
-        if key > MAX_ARRAY_INDEX || key < -MAX_ARRAY_INDEX {
+        if !(-MAX_ARRAY_INDEX..=MAX_ARRAY_INDEX).contains(&key) {
             return None;
         }
         if key >= 0 {

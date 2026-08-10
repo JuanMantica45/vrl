@@ -479,6 +479,27 @@ mod tests {
             want: Ok(value!({ "root": { "a": { "a1": "test" }, "b" : "test2" } })),
             tdef: type_def(),
         }
+
+        // OBE-10731: an element whose only child is a comment or processing instruction took
+        // the single-child "flatten" path, handing a non-element/non-text node to
+        // `process_node`, which hits `unreachable!("shouldn't be other XML nodes")`.
+        only_child_is_a_comment {
+            args: func_args![ value: "<a><!-- comment --></a>"],
+            want: Ok(value!({ "a": {} })),
+            tdef: type_def(),
+        }
+
+        only_child_is_a_processing_instruction {
+            args: func_args![ value: "<a><?target data?></a>"],
+            want: Ok(value!({ "a": {} })),
+            tdef: type_def(),
+        }
+
+        comment_alongside_an_element_child_is_skipped {
+            args: func_args![ value: "<a><!-- comment --><b>x</b></a>"],
+            want: Ok(value!({ "a": { "b": "x" } })),
+            tdef: type_def(),
+        }
     ];
 
     #[test]

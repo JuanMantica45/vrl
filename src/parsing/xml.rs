@@ -164,9 +164,7 @@ fn process_node(node: Node, config: &ParseXmlConfig) -> Value {
                     1 => {
                         // Skip non-element/non-text nodes (e.g. comments, PIs) to prevent
                         // passing them to process_node which cannot handle them.
-                        let child = node
-                            .children()
-                            .find(|n| n.is_element() || n.is_text());
+                        let child = node.children().find(|n| n.is_element() || n.is_text());
                         match child {
                             Some(node) if node.is_element() => {
                                 let mut map = BTreeMap::new();

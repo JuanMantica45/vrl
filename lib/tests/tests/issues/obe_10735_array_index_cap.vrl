@@ -1,0 +1,12 @@
+# issue: OBE-10735
+# Assigning to a large array index padded the array with `Value::Null` up to that index with no
+# cap, so an event-controlled index could exhaust memory. Indices beyond ±32768 are now ignored.
+# result: [0, 32769]
+
+capped = []
+capped[40000] = 1
+
+allowed = []
+allowed[32768] = 1
+
+[length(capped), length(allowed)]

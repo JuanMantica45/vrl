@@ -1,0 +1,13 @@
+# issue: OBE-10727
+# Overflowing multiplication produces a legitimate `inf` float, and multiplying that by zero
+# yields NaN. `NotNan`'s `Mul` impl panicked on that, taking the process down.
+# result: can't multiply type float by float
+
+x = 1000000.0
+x = x * x
+x = x * x
+x = x * x
+x = x * x
+x = x * x
+x = x * x
+x * 0.0
