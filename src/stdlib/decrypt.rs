@@ -59,7 +59,7 @@ macro_rules! decrypt_stream {
     ($algorithm:ty, $plaintext:expr, $key:expr, $iv:expr) => {{
         <$algorithm>::new(&GenericArray::from(get_key_bytes($key)?))
             .decrypt(&GenericArray::from(get_iv_bytes($iv)?), $plaintext.as_ref())
-            .expect("key/iv sizes were already checked")
+            .map_err(|_| "decryption failed (authentication tag mismatch)")?
     }};
 }
 
@@ -381,6 +381,37 @@ mod tests {
         xsalsa20_poly1305 {
             args: func_args![ciphertext: value!(b"(\xc8\xb8\x88\x1d\xc0\xc0F\xa5\xc7n\xc8\x05B\t\xceiR\x8f\xaf\xc7\xa8\xeb.\x95(\x14\xe8C\x80[w\x85\xf3\x8dn"), algorithm: "XSALSA20-POLY1305", key: "32_bytes_xxxxxxxxxxxxxxxxxxxxxxx", iv: "24_bytes_xxxxxxxxxxxxxxx"],
             want: Ok(value!("morethan1blockofdata")),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        // OBE-10720: bad AEAD ciphertext must return a VRL error, not panic
+        chacha20_poly1305_bad_tag {
+            args: func_args![ciphertext: value!(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"), algorithm: "CHACHA20-POLY1305", key: "32_bytes_xxxxxxxxxxxxxxxxxxxxxxx", iv: "12_bytes_xxx"],
+            want: Err("decryption failed (authentication tag mismatch)"),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        xchacha20_poly1305_bad_tag {
+            args: func_args![ciphertext: value!(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"), algorithm: "XCHACHA20-POLY1305", key: "32_bytes_xxxxxxxxxxxxxxxxxxxxxxx", iv: "24_bytes_xxxxxxxxxxxxxxx"],
+            want: Err("decryption failed (authentication tag mismatch)"),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        xsalsa20_poly1305_bad_tag {
+            args: func_args![ciphertext: value!(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"), algorithm: "XSALSA20-POLY1305", key: "32_bytes_xxxxxxxxxxxxxxxxxxxxxxx", iv: "24_bytes_xxxxxxxxxxxxxxx"],
+            want: Err("decryption failed (authentication tag mismatch)"),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        aes_128_siv_bad_tag {
+            args: func_args![ciphertext: value!(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"), algorithm: "AES-128-SIV", key: "32_bytes_xxxxxxxxxxxxxxxxxxxxxxx", iv: "16_bytes_xxxxxxx"],
+            want: Err("decryption failed (authentication tag mismatch)"),
+            tdef: TypeDef::bytes().fallible(),
+        }
+
+        aes_256_siv_bad_tag {
+            args: func_args![ciphertext: value!(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"), algorithm: "AES-256-SIV", key: "64_bytes_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", iv: "16_bytes_xxxxxxx"],
+            want: Err("decryption failed (authentication tag mismatch)"),
             tdef: TypeDef::bytes().fallible(),
         }
     ];

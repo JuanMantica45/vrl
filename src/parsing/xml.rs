@@ -175,9 +175,14 @@ fn process_node(node: Node, config: &ParseXmlConfig) -> Value {
                             );
 
                             Value::Object(map)
-                        } else {
-                            // Otherwise, 'flatten' the object by continuing processing.
+                        } else if node.is_text() {
+                            // 'Flatten' the object by continuing processing.
                             process_node(node, config)
+                        } else {
+                            // Comment or PI as the sole child — return empty object
+                            // rather than forwarding into process_node where it would
+                            // hit an unreachable arm.
+                            Value::Object(BTreeMap::new())
                         }
                     }
                     // For 2+ nodes, expand.
@@ -186,7 +191,9 @@ fn process_node(node: Node, config: &ParseXmlConfig) -> Value {
             }
         }
         NodeType::Text => process_text(node.text().expect("expected XML text node"), config),
-        _ => unreachable!("shouldn't be other XML nodes"),
+        // Comment and PI nodes are skipped by the multi-child filter; reaching here
+        // means a caller forwarded one directly. Return empty object rather than panic.
+        NodeType::Comment | NodeType::PI => Value::Object(BTreeMap::new()),
     }
 }
 

@@ -68,7 +68,10 @@ impl Function for MatchAny {
             re_strings.push(re.to_string());
         }
 
-        let regex_set = RegexSet::new(re_strings).expect("regex were already valid");
+        let regex_set = RegexSet::new(re_strings).map_err(|e| {
+            Box::new(ExpressionError::from(format!("could not compile regex set: {e}")))
+                as Box<dyn DiagnosticMessage>
+        })?;
 
         Ok(MatchAnyFn { value, regex_set }.as_expr())
     }
@@ -122,4 +125,50 @@ mod tests {
             tdef: TypeDef::boolean().infallible(),
         }
     ];
+
+    // OBE-10725: `RegexSet::new` fails when the *combined* compiled size of the
+    // patterns exceeds the regex crate's size limit. That used to be an
+    // `expect`, aborting the process at compile time; it must now surface as a
+    // recoverable compilation error.
+    //
+    // Each pattern below compiles fine on its own — only the union is over the
+    // limit — so this exercises exactly the path that no other test reaches.
+    #[test]
+    fn oversized_regex_set_fails_to_compile_without_panicking() {
+        let pattern_a = "x0(?:[a-z]{100000})";
+        let pattern_b = "x1(?:[a-z]{100000})";
+
+        // Precondition: individually valid. If a future regex version changes its
+        // limits this asserts loudly rather than silently voiding the test.
+        let regex_a = Regex::new(pattern_a).expect("pattern A must compile alone");
+        let regex_b = Regex::new(pattern_b).expect("pattern B must compile alone");
+        assert!(
+            regex::bytes::RegexSet::new([pattern_a, pattern_b]).is_err(),
+            "precondition: the combined set must exceed the regex size limit"
+        );
+
+        let state = state::TypeState::default();
+        let mut ctx = FunctionCompileContext::new(
+            crate::diagnostic::Span::new(0, 0),
+            crate::compiler::CompileConfig::default(),
+        );
+        let args = func_args![
+            value: "irrelevant",
+            patterns: Value::Array(vec![
+                Value::Regex(regex_a.into()),
+                Value::Regex(regex_b.into()),
+            ])
+        ];
+
+        let error = MatchAny
+            .compile(&state, &mut ctx, args.into())
+            .err()
+            .expect("an oversized regex set must fail to compile");
+
+        let message = error.message();
+        assert!(
+            message.contains("could not compile regex set"),
+            "expected a regex-set compilation error, got: {message}"
+        );
+    }
 }

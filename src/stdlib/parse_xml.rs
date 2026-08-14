@@ -479,6 +479,27 @@ mod tests {
             want: Ok(value!({ "root": { "a": { "a1": "test" }, "b" : "test2" } })),
             tdef: type_def(),
         }
+
+        // OBE-10731: element whose sole child is a Comment must not panic
+        comment_only_child {
+            args: func_args![value: "<a><!--x--></a>"],
+            want: Ok(value!({ "a": {} })),
+            tdef: type_def(),
+        }
+
+        // OBE-10731: element whose sole child is a PI must not panic
+        pi_only_child {
+            args: func_args![value: "<a><?pi?></a>"],
+            want: Ok(value!({ "a": {} })),
+            tdef: type_def(),
+        }
+
+        // OBE-10731: nested element whose sole child is a comment must not panic
+        nested_comment_only_child {
+            args: func_args![value: "<r><inner><!--boom--></inner></r>"],
+            want: Ok(value!({ "r": { "inner": {} } })),
+            tdef: type_def(),
+        }
     ];
 
     #[test]

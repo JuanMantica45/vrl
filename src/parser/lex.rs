@@ -41,6 +41,9 @@ pub enum Error {
     #[error("invalid escape character: \\{}", .ch.unwrap_or_default())]
     EscapeChar { start: usize, ch: Option<char> },
 
+    #[error("invalid unicode escape sequence")]
+    UnicodeEscape { start: usize, end: usize },
+
     #[error("unexpected parse error")]
     UnexpectedParseError(String),
 }
@@ -49,7 +52,7 @@ impl DiagnosticMessage for Error {
     fn code(&self) -> usize {
         use Error::{
             EscapeChar, Literal, NumericLiteral, ParseError, ReservedKeyword, StringLiteral,
-            UnexpectedParseError,
+            UnexpectedParseError, UnicodeEscape,
         };
 
         match self {
@@ -66,13 +69,14 @@ impl DiagnosticMessage for Error {
             Literal { .. } => 208,
             EscapeChar { .. } => 209,
             UnexpectedParseError(..) => 210,
+            UnicodeEscape { .. } => 211,
         }
     }
 
     fn labels(&self) -> Vec<Label> {
         use Error::{
             EscapeChar, Literal, NumericLiteral, ParseError, ReservedKeyword, StringLiteral,
-            UnexpectedParseError,
+            UnexpectedParseError, UnicodeEscape,
         };
 
         fn update_expected(expected: Vec<String>) -> Vec<String> {
@@ -190,6 +194,11 @@ impl DiagnosticMessage for Error {
             )],
 
             UnexpectedParseError(string) => vec![Label::primary(string, Span::default())],
+
+            UnicodeEscape { start, end } => vec![Label::primary(
+                "invalid unicode escape sequence",
+                Span::new(*start, *end),
+            )],
         }
     }
 }
@@ -1221,14 +1230,66 @@ impl<'input> Lexer<'input> {
     }
 
     /// Returns Ok if the next char is a valid escape code.
+    ///
+    /// The set of accepted single-character escapes is `ESCAPE_TABLE`, which
+    /// `unescape_string_literal` also decodes from — accepting an escape here
+    /// that the table cannot decode is what made `\}` a runtime panic.
     fn escape_code(&mut self, start: usize) -> Result<(), Error> {
         match self.bump() {
-            Some((_, '\n' | '\'' | '"' | '\\' | 'n' | 'r' | 't' | '{' | '}' | '0')) => Ok(()),
+            // A newline is a line continuation, not a 1:1 character escape:
+            // `unescape_string_literal` swallows it along with the indentation
+            // that follows, so it is not in `ESCAPE_TABLE`.
+            Some((_, '\n')) => Ok(()),
+            Some((_, 'u')) => self.unicode_escape(start),
+            Some((_, ch)) if unescape_char(ch).is_some() => Ok(()),
             Some((start, ch)) => Err(Error::EscapeChar {
                 start,
                 ch: Some(ch),
             }),
             None => Err(Error::EscapeChar { start, ch: None }),
+        }
+    }
+
+    /// Validates a `\u{HEX}` Unicode escape sequence after the `u` has been consumed.
+    ///
+    /// `start` is the byte position of the leading `\`. All `UnicodeEscape` errors
+    /// span from `start` to the current position so the entire `\u{...}` sequence
+    /// is highlighted in diagnostics.
+    fn unicode_escape(&mut self, start: usize) -> Result<(), Error> {
+        match self.bump() {
+            Some((_, '{')) => {}
+            Some((s, ch)) => {
+                return Err(Error::EscapeChar {
+                    start: s,
+                    ch: Some(ch),
+                });
+            }
+            None => return Err(Error::EscapeChar { start, ch: None }),
+        }
+        let hex_start = self.next_index();
+        loop {
+            match self.peek() {
+                Some((_, '}')) => {
+                    let hex_end = self.next_index();
+                    self.bump();
+                    let end = self.next_index();
+                    // Decoded through the same helper `unescape_string_literal`
+                    // uses, so what lexes is exactly what unescapes.
+                    decode_unicode_escape(&self.input[hex_start..hex_end])
+                        .ok_or(Error::UnicodeEscape { start, end })?;
+                    return Ok(());
+                }
+                Some((_, ch)) if ch.is_ascii_hexdigit() => {
+                    self.bump();
+                }
+                Some((pos, ch)) => {
+                    return Err(Error::EscapeChar {
+                        start: pos,
+                        ch: Some(ch),
+                    });
+                }
+                None => return Err(Error::EscapeChar { start, ch: None }),
+            }
         }
     }
 }
@@ -1266,10 +1327,68 @@ pub(crate) fn is_operator(ch: char) -> bool {
     )
 }
 
+/// Every single-character escape the language accepts, and the character it
+/// decodes to.
+///
+/// This is the one definition: `escape_code` validates against it while lexing
+/// and `unescape_string_literal` decodes with it afterwards, so an escape can
+/// never be accepted by one and be unknown to the other. Keeping those as two
+/// hand-maintained lists is what let `\}` lex successfully and then hit an
+/// `unimplemented!` at unescape time (OBE-10734).
+///
+/// `\<newline>` (line continuation) and `\u{HEX}` are absent by design — neither
+/// is a 1:1 character mapping, so both are handled explicitly at both sites.
+const ESCAPE_TABLE: &[(u8, char)] = &[
+    (b'\'', '\''),
+    (b'"', '"'),
+    (b'\\', '\\'),
+    (b'n', '\n'),
+    (b'r', '\r'),
+    (b't', '\t'),
+    (b'0', '\0'),
+    (b'{', '{'),
+    (b'}', '}'),
+];
+
+/// Resolves an escape character to the character it stands for, or `None` if it
+/// is not a recognised escape.
+///
+/// Takes a `char` so the lexer can call it directly; non-ASCII input can never
+/// match, since every escape character in `ESCAPE_TABLE` is ASCII.
+fn unescape_char(ch: char) -> Option<char> {
+    let byte = u8::try_from(ch as u32).ok()?;
+    ESCAPE_TABLE
+        .iter()
+        .find(|(escape, _)| *escape == byte)
+        .map(|(_, unescaped)| *unescaped)
+}
+
+/// Decodes the hex body of a `\u{HEX}` escape — the part between the braces.
+///
+/// Returns `None` for an empty body, a value that is not valid hex or does not
+/// fit a `u32`, and for codepoints that are not Unicode scalar values
+/// (surrogates and anything above U+10FFFF). Shared by the lexer, which uses it
+/// to reject bad escapes, and by `unescape_string_literal`, which uses it to
+/// produce the character — so the two can never disagree on what is legal.
+fn decode_unicode_escape(hex: &str) -> Option<char> {
+    if hex.is_empty() {
+        return None;
+    }
+
+    char::from_u32(u32::from_str_radix(hex, 16).ok()?)
+}
+
 fn unescape_string_literal(mut s: &str) -> String {
     let mut string = String::with_capacity(s.len());
     while let Some(i) = s.bytes().position(|b| b == b'\\') {
-        let next = s.as_bytes()[i + 1];
+        // The lexer never emits a literal ending in a lone backslash (it would
+        // have escaped the closing quote), so there is always an escape
+        // character here. Treat a trailing backslash as literal text rather
+        // than indexing out of bounds if that ever stops holding.
+        let Some(&next) = s.as_bytes().get(i + 1) else {
+            debug_assert!(false, "string literal ended with a lone backslash");
+            break;
+        };
         if next == b'\n' {
             // Remove the \n and any ensuing spaces or tabs
             string.push_str(&s[..i]);
@@ -1280,22 +1399,47 @@ fn unescape_string_literal(mut s: &str) -> String {
                 .map(char::len_utf8)
                 .sum();
             s = &s[i + whitespace + 2..];
-        } else {
-            let c = match next {
-                b'\'' => '\'',
-                b'"' => '"',
-                b'\\' => '\\',
-                b'n' => '\n',
-                b'r' => '\r',
-                b't' => '\t',
-                b'0' => '\0',
-                b'{' => '{',
-                _ => unimplemented!("invalid escape"),
-            };
+        } else if next == b'u' {
+            // `\u{HEX}`: the lexer has already validated the syntax and that the
+            // codepoint is a legal `char` — via `decode_unicode_escape`, the same
+            // helper called here — so every step below is expected to succeed. It
+            // is nonetheless written to degrade gracefully rather than abort the
+            // process, because `template()` rewrites literal content before it
+            // reaches this function — the invariant spans two distant pieces of
+            // code, and a future edit there must not become a crash here.
+            let decoded = s.get(i + 3..).and_then(|rest| {
+                // skipped past `\u{`
+                let close = rest.find('}')?;
+                let ch = decode_unicode_escape(&rest[..close])?;
+                Some((ch, &rest[close + 1..]))
+            });
 
-            string.push_str(&s[..i]);
-            string.push(c);
-            s = &s[i + 2..];
+            if let Some((ch, remainder)) = decoded {
+                string.push_str(&s[..i]);
+                string.push(ch);
+                s = remainder;
+            } else {
+                debug_assert!(false, "lexer should have validated this \\u{{..}} escape");
+                // Keep the backslash as literal text and resume just after it,
+                // so the loop always makes progress.
+                string.push_str(&s[..=i]);
+                s = &s[i + 1..];
+            }
+        } else {
+            // Decoded from `ESCAPE_TABLE`, the same table `escape_code`
+            // validates against, so anything the lexer accepted resolves here.
+            if let Some(c) = unescape_char(char::from(next)) {
+                string.push_str(&s[..i]);
+                string.push(c);
+                s = &s[i + 2..];
+            } else {
+                debug_assert!(false, "lexer should have rejected this escape");
+                // Unknown escape. Emit the backslash literally and resume after
+                // it rather than guessing at the intended character (`next` may
+                // be one byte of a multi-byte character).
+                string.push_str(&s[..=i]);
+                s = &s[i + 1..];
+            }
         }
     }
 
@@ -2144,6 +2288,155 @@ mod test {
             ]),
             string.template(Span::new(0, 22))
         );
+    }
+
+    // OBE-10734 regression guard: the lexer accepting an escape that the
+    // unescaper cannot decode is the bug class this test closes off. Driving
+    // every ESCAPE_TABLE entry through both sides means adding an entry cannot
+    // silently leave one of them behind.
+    #[test]
+    fn escape_table_lexes_and_unescapes_consistently() {
+        for &(escape, unescaped) in ESCAPE_TABLE {
+            let escape = char::from(escape);
+            let source = format!(r#""\{escape}""#);
+
+            // The lexer accepts it...
+            let mut lex = lexer(&source);
+            match lex.next() {
+                Some(Ok((_, StringLiteral(token), _))) => {
+                    // ...and the unescaper produces exactly the table's char.
+                    assert_eq!(
+                        token.unescape(),
+                        unescaped.to_string(),
+                        "\\{escape} unescaped to the wrong character"
+                    );
+                }
+                other => panic!("\\{escape} was rejected by the lexer: {other:?}"),
+            }
+        }
+    }
+
+    // The inverse: an escape absent from the table must be rejected while
+    // lexing, so the graceful fallback in unescape_string_literal is never the
+    // thing deciding what a program means.
+    #[test]
+    fn escape_outside_table_is_rejected_by_lexer() {
+        for escape in ['a', 'x', 'q', '1', 'U'] {
+            assert!(
+                unescape_char(escape).is_none(),
+                "test picked \\{escape}, which is a real escape"
+            );
+            assert!(
+                lexer(&format!(r#""\{escape}""#)).last().unwrap().is_err(),
+                "\\{escape} should not lex"
+            );
+        }
+    }
+
+    // OBE-10734: \} must unescape to } rather than hitting unimplemented!()
+    #[test]
+    fn escaped_close_brace_unescapes_cleanly() {
+        let token = StringLiteralToken("\\}");
+        assert_eq!(token.unescape(), "}");
+    }
+
+    #[test]
+    fn escaped_close_brace_in_string_literal() {
+        let token = StringLiteralToken("hello\\}world");
+        assert_eq!(token.unescape(), "hello}world");
+    }
+
+    // OBE-10734 (upstream sync): \u{HEX} unicode escape support
+    #[test]
+    fn unicode_escape_basic() {
+        let token = StringLiteralToken("\\u{41}");
+        assert_eq!(token.unescape(), "A");
+    }
+
+    #[test]
+    fn unicode_escape_multibyte() {
+        // U+1F600 GRINNING FACE
+        let token = StringLiteralToken("\\u{1F600}");
+        assert_eq!(token.unescape(), "\u{1F600}");
+    }
+
+    #[test]
+    fn unicode_escape_in_string() {
+        let token = StringLiteralToken("hello\\u{20}world");
+        assert_eq!(token.unescape(), "hello world");
+    }
+
+    #[test]
+    fn unicode_escape_null() {
+        let token = StringLiteralToken("\\u{0}");
+        assert_eq!(token.unescape(), "\0");
+    }
+
+    #[test]
+    fn unicode_escape_invalid_codepoint_rejected_by_lexer() {
+        // D800 is a surrogate — escape_code/unicode_escape returns Err so the
+        // string never reaches unescape_string_literal. Verify via tokenization.
+        let src = r#""hello\u{D800}world""#;
+        let mut lexer = Lexer::new(src);
+        let tokens: Vec<_> = lexer.by_ref().collect();
+        assert!(
+            tokens.iter().any(|t| t.is_err()),
+            "expected a lex error for surrogate codepoint"
+        );
+    }
+
+    #[test]
+    fn unicode_escape_empty_braces_rejected_by_lexer() {
+        let src = r#""\u{}""#;
+        let mut lexer = Lexer::new(src);
+        let tokens: Vec<_> = lexer.by_ref().collect();
+        assert!(
+            tokens.iter().any(|t| t.is_err()),
+            "expected a lex error for empty unicode escape"
+        );
+    }
+
+    #[test]
+    fn unicode_escape_missing_open_brace_rejected_by_lexer() {
+        let src = r#""\u41""#;
+        let mut lexer = Lexer::new(src);
+        let tokens: Vec<_> = lexer.by_ref().collect();
+        assert!(
+            tokens.iter().any(|t| t.is_err()),
+            "expected a lex error for missing open brace in unicode escape"
+        );
+    }
+
+    // The other positive `\u{..}` tests construct a `StringLiteralToken` by hand,
+    // which skips the lexer. `unescape_string_literal` assumes the lexer already
+    // validated the escape, so lock in that the two really do agree by driving a
+    // literal through tokenization and *then* unescaping the resulting token.
+    #[test]
+    fn unicode_escape_tokenizes_and_unescapes_end_to_end() {
+        for (src, want) in [
+            (r#""\u{41}""#, "A"),
+            (r#""\u{1F600}""#, "\u{1F600}"),
+            (r#""a\u{20}b\u{9}c""#, "a b\tc"),
+            (r#""\u{10FFFF}""#, "\u{10FFFF}"), // highest legal codepoint
+            (r#""\u{000041}""#, "A"),          // leading zeros
+        ] {
+            let tokens: Vec<_> = Lexer::new(src).collect();
+            assert!(
+                tokens.iter().all(|t| t.is_ok()),
+                "{src} should tokenize cleanly, got {tokens:?}"
+            );
+
+            let literal = tokens
+                .into_iter()
+                .filter_map(|t| match t {
+                    Ok((_, Token::StringLiteral(literal), _)) => Some(literal),
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_else(|| panic!("{src} should produce a string literal token"));
+
+            assert_eq!(literal.unescape(), want, "unescaping {src}");
+        }
     }
 
     #[test]

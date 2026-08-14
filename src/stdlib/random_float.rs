@@ -2,27 +2,32 @@ use crate::compiler::prelude::*;
 use rand::{thread_rng, Rng};
 use std::ops::Range;
 
+const NON_FINITE_ERR: &str = "min and max must be finite";
 const INVALID_RANGE_ERR: &str = "max must be greater than min";
+const RANGE_OVERFLOW_ERR: &str = "range max - min overflows";
 
 fn random_float(min: Value, max: Value) -> Resolved {
-    let min = min.try_float()?;
-    let max = max.try_float()?;
+    let range = get_range(min.try_float()?, max.try_float()?)?;
 
-    if max <= min {
-        return Err("max must be greater than min".into());
-    }
+    let f: f64 = thread_rng().gen_range(range);
 
-    let f: f64 = thread_rng().gen_range(min..max);
-
-    Ok(Value::Float(NotNan::new(f).expect("always a number")))
+    Ok(Value::from_f64_or_zero(f))
 }
 
-fn get_range(min: Value, max: Value) -> std::result::Result<Range<f64>, &'static str> {
-    let min = min.try_float().expect("min must be a float");
-    let max = max.try_float().expect("max must be a float");
-
+/// The single place the `random_float` bounds are validated.
+///
+/// `gen_range` panics on a non-finite or empty range, and on a `max - min`
+/// width that overflows to infinity, so every caller — compile time and
+/// runtime — must go through here.
+fn get_range(min: f64, max: f64) -> std::result::Result<Range<f64>, &'static str> {
+    if !min.is_finite() || !max.is_finite() {
+        return Err(NON_FINITE_ERR);
+    }
     if max <= min {
         return Err(INVALID_RANGE_ERR);
+    }
+    if !(max - min).is_finite() {
+        return Err(RANGE_OVERFLOW_ERR);
     }
 
     Ok(min..max)
@@ -72,13 +77,15 @@ impl Function for RandomFloat {
         let max = arguments.required("max");
 
         if let (Some(min), Some(max)) = (min.resolve_constant(state), max.resolve_constant(state)) {
-            // check if range is valid
-            let _: Range<f64> =
-                get_range(min, max.clone()).map_err(|err| function::Error::InvalidArgument {
+            // check if range is valid. Non-float constants are rejected by
+            // argument-kind validation, so skipping them here loses nothing.
+            if let (Ok(min), Ok(max_f)) = (min.try_float(), max.clone().try_float()) {
+                get_range(min, max_f).map_err(|err| function::Error::InvalidArgument {
                     keyword: "max",
                     value: max,
                     error: err,
                 })?;
+            }
         }
 
         Ok(RandomFloatFn { min, max }.as_expr())
@@ -104,13 +111,10 @@ impl FunctionExpression for RandomFloatFn {
             self.min.resolve_constant(state),
             self.max.resolve_constant(state),
         ) {
-            (Some(min), Some(max)) => {
-                if get_range(min, max).is_ok() {
-                    TypeDef::float().infallible()
-                } else {
-                    TypeDef::float().fallible()
-                }
-            }
+            (Some(min), Some(max)) => match (min.try_float(), max.try_float()) {
+                (Ok(min), Ok(max)) if get_range(min, max).is_ok() => TypeDef::float().infallible(),
+                _ => TypeDef::float().fallible(),
+            },
             _ => TypeDef::float().fallible(),
         }
     }
@@ -130,5 +134,60 @@ mod tests {
             want: Err("invalid argument"),
             tdef: TypeDef::float().fallible(),
         }
+
+        // OBE-10730: constant infinite bounds must now be caught at compile time (type_def fallible).
+        infinite_max_compile_time {
+            args: func_args![min: value!(0.0), max: Value::Float(NotNan::new(f64::INFINITY).unwrap())],
+            want: Err("invalid argument"),
+            tdef: TypeDef::float().fallible(),
+        }
+
+        overflow_range_compile_time {
+            args: func_args![min: Value::Float(NotNan::new(-1.0e308).unwrap()), max: Value::Float(NotNan::new(1.0e308).unwrap())],
+            want: Err("invalid argument"),
+            tdef: TypeDef::float().fallible(),
+        }
     ];
+
+    // Positive: valid finite bounds succeed and produce a value in [min, max).
+    #[test]
+    fn valid_finite_range_returns_ok_in_range() {
+        let min = Value::Float(NotNan::new(0.0).unwrap());
+        let max = Value::Float(NotNan::new(10.0).unwrap());
+        let result = random_float(min, max).expect("should succeed");
+        let f = match result {
+            Value::Float(v) => *v,
+            _ => panic!("expected float"),
+        };
+        assert!(f >= 0.0 && f < 10.0, "result {f} out of [0, 10)");
+    }
+
+    // OBE-10730: non-finite bounds and range-overflow must return errors, not panic.
+    #[test]
+    fn non_finite_min_returns_error() {
+        let min = Value::Float(NotNan::new(f64::INFINITY).unwrap());
+        let max = Value::Float(NotNan::new(1.0).unwrap());
+        assert!(random_float(min, max).is_err());
+    }
+
+    #[test]
+    fn non_finite_max_returns_error() {
+        let min = Value::Float(NotNan::new(0.0).unwrap());
+        let max = Value::Float(NotNan::new(f64::INFINITY).unwrap());
+        assert!(random_float(min, max).is_err());
+    }
+
+    #[test]
+    fn negative_infinity_returns_error() {
+        let min = Value::Float(NotNan::new(f64::NEG_INFINITY).unwrap());
+        let max = Value::Float(NotNan::new(0.0).unwrap());
+        assert!(random_float(min, max).is_err());
+    }
+
+    #[test]
+    fn range_overflow_returns_error() {
+        let min = Value::Float(NotNan::new(-1.0e308).unwrap());
+        let max = Value::Float(NotNan::new(1.0e308).unwrap());
+        assert!(random_float(min, max).is_err());
+    }
 }
