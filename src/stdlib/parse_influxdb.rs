@@ -6,7 +6,28 @@ use influxdb_line_protocol::{FieldValue, ParsedLine};
 use crate::compiler::prelude::*;
 use crate::{btreemap, value};
 
-fn influxdb_line_to_metrics(line: ParsedLine) -> Result<Vec<ObjectMap>, ExpressionError> {
+/// Limits that bound how much memory `parse_influxdb` can be made to allocate
+/// (OBE-10729).
+///
+/// Every field in a line becomes its own metric object, and each of those
+/// carries a full deep copy of that line's tag set, so the output grows as
+/// `tags × fields`. Measured before this cap, ~11 KiB of input (800 tags and
+/// 800 fields) expanded to ~106 MiB resident — roughly 8,700x — and the ticket's
+/// larger payload OOM-kills a 16 GiB host.
+const MAX_TAGS_PER_SERIES: usize = 256;
+const MAX_FIELDS_PER_LINE: usize = 1024;
+
+/// Budget on tag copies for the whole call, not just one line.
+///
+/// The per-line caps above are on their own insufficient: one call parses many
+/// lines and flattens them together, so an input made of many lines that each
+/// sit just under those caps would still multiply out to the same blow-up.
+const MAX_TOTAL_TAG_ENTRIES: usize = 262_144;
+
+fn influxdb_line_to_metrics(
+    line: ParsedLine,
+    tag_entry_budget: &mut usize,
+) -> Result<Vec<ObjectMap>, ExpressionError> {
     let ParsedLine {
         series,
         field_set,
@@ -14,6 +35,25 @@ fn influxdb_line_to_metrics(line: ParsedLine) -> Result<Vec<ObjectMap>, Expressi
     } = line;
 
     let timestamp = timestamp.map(DateTime::from_timestamp_nanos);
+
+    // Reject before building anything, so an over-limit line costs nothing.
+    let tag_count = match series.tag_set.as_ref() {
+        Some(tags) => tags.len(),
+        None => 0,
+    };
+    if tag_count > MAX_TAGS_PER_SERIES {
+        return Err(Error::TooManyTags.into());
+    }
+    if field_set.len() > MAX_FIELDS_PER_LINE {
+        return Err(Error::TooManyFields.into());
+    }
+
+    // Charge this line's tag copies (one per field) against the call budget.
+    let tag_entries = tag_count.saturating_mul(field_set.len());
+    if tag_entries > *tag_entry_budget {
+        return Err(Error::TagEntryBudgetExceeded.into());
+    }
+    *tag_entry_budget -= tag_entries;
 
     let tags: Option<ObjectMap> = series.tag_set.as_ref().map(|tags| {
         tags.iter()
@@ -79,6 +119,12 @@ enum Error {
     StringFieldSetValuesNotSupported,
     #[error("NaN field set values are not supported")]
     NaNFieldSetValuesNotSupported,
+    #[error("too many tags in a single line (limit {MAX_TAGS_PER_SERIES})")]
+    TooManyTags,
+    #[error("too many fields in a single line (limit {MAX_FIELDS_PER_LINE})")]
+    TooManyFields,
+    #[error("input expands to too many tag entries (limit {MAX_TOTAL_TAG_ENTRIES})")]
+    TagEntryBudgetExceeded,
 }
 
 impl From<Error> for ExpressionError {
@@ -96,10 +142,15 @@ fn parse_influxdb(bytes: Value) -> Resolved {
     let line = String::from_utf8_lossy(&bytes);
     let parsed_line = influxdb_line_protocol::parse_lines(&line);
 
+    // One budget shared by every line in this call (OBE-10729).
+    let mut tag_entry_budget = MAX_TOTAL_TAG_ENTRIES;
+
     let metrics = parsed_line
         .into_iter()
         .map(|line_result| line_result.map_err(ExpressionError::from))
-        .map(|line_result| line_result.and_then(influxdb_line_to_metrics))
+        .map(|line_result| {
+            line_result.and_then(|line| influxdb_line_to_metrics(line, &mut tag_entry_budget))
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
@@ -427,5 +478,105 @@ mod test {
             want: Err("InfluxDB line protocol parsing error: No fields were provided"),
             tdef: type_def(),
         }
+
+        // OBE-10729: every field in a line gets a full copy of that line's tag
+        // set, so `tags x fields` output growth turned ~11 KiB of input into
+        // ~106 MiB resident. These three cases cover the shapes that exploit it.
+        influxdb_too_many_tags_rejected {
+            args: func_args![ value: influx_line(MAX_TAGS_PER_SERIES + 1, 8) ],
+            want: Err("Error while converting InfluxDB line protocol metric to Vector's metric model: too many tags in a single line (limit 256)"),
+            tdef: type_def(),
+        }
+
+        influxdb_too_many_fields_rejected {
+            args: func_args![ value: influx_line(2, MAX_FIELDS_PER_LINE + 1) ],
+            want: Err("Error while converting InfluxDB line protocol metric to Vector's metric model: too many fields in a single line (limit 1024)"),
+            tdef: type_def(),
+        }
+
+        // Each line here is individually within both per-line caps, so only the
+        // call-wide budget stops it. Without that budget this input would
+        // materialize 40 x 250 x 1000 = 10M tag entries.
+        influxdb_many_lines_under_per_line_caps_rejected {
+            args: func_args![ value: (0..40)
+                .map(|i| format!("m{i},{} {}",
+                    (0..250).map(|t| format!("a{t}=0")).collect::<Vec<_>>().join(","),
+                    (0..1000).map(|f| format!("f{f}=0")).collect::<Vec<_>>().join(",")))
+                .collect::<Vec<_>>()
+                .join("\n") ],
+            want: Err("Error while converting InfluxDB line protocol metric to Vector's metric model: input expands to too many tag entries (limit 262144)"),
+            tdef: type_def(),
+        }
+
     ];
+
+    /// Build an InfluxDB line with `tags` tag pairs and `fields` field pairs.
+    fn influx_line(tags: usize, fields: usize) -> String {
+        let tag_set = (0..tags)
+            .map(|i| format!("a{i}=0"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let field_set = (0..fields)
+            .map(|i| format!("f{i}=0"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if tag_set.is_empty() {
+            format!("m {field_set}")
+        } else {
+            format!("m,{tag_set} {field_set}")
+        }
+    }
+
+    // OBE-10729: the limits must hold the output bounded rather than merely
+    // rejecting one hand-picked payload. Drive the worst legal shape and assert
+    // the number of materialized tag entries stays within the budget.
+    #[test]
+    fn tag_entry_output_is_bounded_by_the_budget() {
+        // 40 lines x 250 tags x 1000 fields — each line legal, total over budget.
+        let input = (0..40)
+            .map(|i| format!("m{i},{} {}",
+                (0..250).map(|t| format!("a{t}=0")).collect::<Vec<_>>().join(","),
+                (0..1000).map(|f| format!("f{f}=0")).collect::<Vec<_>>().join(",")))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let err = parse_influxdb(Value::from(input))
+            .expect_err("input exceeding the tag-entry budget must be rejected");
+        assert!(
+            err.to_string().contains("too many tag entries"),
+            "expected the call-wide budget to reject this, got: {err}"
+        );
+
+        // And a shape that fits the budget must still succeed, proving the cap
+        // rejects on total cost rather than on line count alone.
+        let ok_input = (0..40)
+            .map(|i| format!("m{i},a0=0,a1=0 f0=0,f1=0"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = parse_influxdb(Value::from(ok_input)).expect("within budget must parse");
+        let Value::Array(metrics) = parsed else {
+            panic!("expected an array of metrics")
+        };
+        assert_eq!(metrics.len(), 80, "40 lines x 2 fields");
+    }
+
+    // A line sitting exactly on both per-line limits is legal and must still
+    // parse — the caps must not be off by one.
+    #[test]
+    fn line_at_per_line_limits_is_accepted() {
+        let at_tag_limit = parse_influxdb(Value::from(influx_line(MAX_TAGS_PER_SERIES, 1)))
+            .expect("a line at exactly MAX_TAGS_PER_SERIES must parse");
+        let Value::Array(metrics) = at_tag_limit else {
+            panic!("expected an array")
+        };
+        assert_eq!(metrics.len(), 1, "one field yields one metric");
+        let Some(Value::Object(tags)) = metrics[0].as_object().and_then(|m| m.get("tags")).cloned()
+        else {
+            panic!("expected a tags object")
+        };
+        assert_eq!(tags.len(), MAX_TAGS_PER_SERIES, "all tags preserved");
+
+        parse_influxdb(Value::from(influx_line(1, MAX_FIELDS_PER_LINE)))
+            .expect("a line at exactly MAX_FIELDS_PER_LINE must parse");
+    }
 }

@@ -83,18 +83,22 @@ impl Function for ParseProto {
     ) -> Compiled {
         let value = arguments.required("value");
         let desc_file = arguments.required_literal("desc_file", state)?;
+        // OBE-10728: every failure below must become a compile diagnostic. These
+        // were `expect`s, so any unreadable/undecodable `desc_file` — a path the
+        // program author fully controls — aborted the whole host process during
+        // compilation rather than failing this one program.
         let desc_file_str = desc_file
             .try_bytes_utf8_lossy()
-            .expect("descriptor file must be a string");
+            .map_err(|e| Box::new(e) as Box<dyn DiagnosticMessage>)?;
         let message_type = arguments.required_literal("message_type", state)?;
         let message_type_str = message_type
             .try_bytes_utf8_lossy()
-            .expect("message_type must be a string");
+            .map_err(|e| Box::new(e) as Box<dyn DiagnosticMessage>)?;
         let os_string: OsString = desc_file_str.into_owned().into();
         let path_buf = PathBuf::from(os_string);
         let path = Path::new(&path_buf);
-        let descriptor =
-            get_message_descriptor(path, &message_type_str).expect("message type not found");
+        let descriptor = get_message_descriptor(path, &message_type_str)
+            .map_err(|e| Box::new(ExpressionError::from(e)) as Box<dyn DiagnosticMessage>)?;
 
         Ok(ParseProtoFn { descriptor, value }.as_expr())
     }
@@ -150,4 +154,47 @@ mod tests {
             tdef: json_type_def(),
         }
     ];
+
+    // OBE-10728: an unreadable/undecodable `desc_file` must fail compilation with
+    // a diagnostic. This used to be `.expect(..)`, which aborted the entire host
+    // process during compilation — and `desc_file` is fully controlled by the
+    // program author, so one short program took down the worker.
+    fn compile_with_desc_file(desc_file: &str) -> Result<(), String> {
+        let state = state::TypeState::default();
+        let mut ctx = FunctionCompileContext::new(
+            crate::diagnostic::Span::new(0, 0),
+            crate::compiler::CompileConfig::default(),
+        );
+        let args = func_args![
+            value: "",
+            desc_file: desc_file.to_owned(),
+            message_type: "X"
+        ];
+        ParseProto
+            .compile(&state, &mut ctx, args.into())
+            .map(|_| ())
+            .map_err(|e| e.message())
+    }
+
+    #[test]
+    fn missing_desc_file_fails_to_compile_without_panicking() {
+        let err = compile_with_desc_file("/nonexistent-descriptor-set")
+            .expect_err("a missing desc_file must fail to compile");
+        assert!(
+            err.contains("Failed to open protobuf desc file"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    // Previously this read forever instead of failing.
+    #[cfg(unix)]
+    #[test]
+    fn character_device_desc_file_fails_to_compile_without_hanging() {
+        let err = compile_with_desc_file("/dev/zero")
+            .expect_err("/dev/zero must fail to compile");
+        assert!(
+            err.contains("is not a regular file"),
+            "unexpected diagnostic: {err}"
+        );
+    }
 }
