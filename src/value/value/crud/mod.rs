@@ -3,7 +3,9 @@ use std::borrow::Borrow;
 
 /// Largest array index `insert_value` will grow an array to, in either direction.
 /// Prevents an event-controlled index (e.g. `.foo[40000000] = 1`) from exhausting memory.
-const MAX_ARRAY_INDEX: usize = 32_768;
+/// `Value` is 40 bytes, so this bounds a single indexed write's preallocation to ~42MB
+/// (1_048_576 * 40 bytes) instead of being unbounded. See OBE-10735.
+const MAX_ARRAY_INDEX: usize = 1_048_576; // 2^20
 
 mod get;
 mod get_mut;

@@ -84,14 +84,14 @@ mod test {
     #[test]
     fn test_insert_beyond_max_array_index_is_rejected() {
         let mut value = Value::Null;
-        assert_eq!(value.insert("[40000]", 1), None);
+        assert_eq!(value.insert("[2000000]", 1), None);
         assert_eq!(value, Value::from(json!([])));
     }
 
     #[test]
     fn test_insert_beyond_max_negative_array_index_is_rejected() {
         let mut value = Value::Null;
-        assert_eq!(value.insert("[-40000]", 1), None);
+        assert_eq!(value.insert("[-2000000]", 1), None);
         assert_eq!(value, Value::from(json!([])));
     }
 
@@ -108,10 +108,10 @@ mod test {
     #[test]
     fn test_insert_at_max_array_index_is_allowed() {
         let mut value = Value::Null;
-        assert_eq!(value.insert("[32768]", 1), None);
+        assert_eq!(value.insert("[1048576]", 1), None);
         let array = value.as_array().expect("expected an array");
-        assert_eq!(array.len(), 32769);
-        assert_eq!(array[32768], Value::Integer(1));
+        assert_eq!(array.len(), 1_048_577);
+        assert_eq!(array[1_048_576], Value::Integer(1));
     }
 
     #[test]

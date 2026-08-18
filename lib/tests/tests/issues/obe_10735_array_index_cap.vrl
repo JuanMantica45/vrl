@@ -1,12 +1,15 @@
 # issue: OBE-10735
 # Assigning to a large array index padded the array with `Value::Null` up to that index with no
-# cap, so an event-controlled index could exhaust memory. Indices beyond ±32768 are now ignored.
-# result: [0, 32769]
+# cap, so an event-controlled index could exhaust memory. Indices beyond ±1048576 (2^20) are now
+# ignored. The limit was raised from the original ±32768 after review feedback that the smaller
+# cap could reject legitimate large-array use cases; 2^20 still bounds a single indexed write's
+# preallocation to ~42MB (Value is 40 bytes) instead of being unbounded.
+# result: [0, 1048577]
 
 capped = []
-capped[40000] = 1
+capped[2000000] = 1
 
 allowed = []
-allowed[32768] = 1
+allowed[1048576] = 1
 
 [length(capped), length(allowed)]
