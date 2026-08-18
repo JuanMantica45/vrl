@@ -1,4 +1,4 @@
-use super::ValueCollection;
+use super::{ValueCollection, MAX_ARRAY_INDEX};
 use crate::path::BorrowedSegment;
 use crate::value::Value;
 use std::borrow::Borrow;
@@ -26,10 +26,11 @@ pub fn insert<'a, T: ValueCollection>(
             if let Some(Value::Array(array)) = value.get_mut_value(key.borrow()) {
                 insert(array, index, path_iter, insert_value)
             } else {
+                let max_capacity = MAX_ARRAY_INDEX + 1;
                 let capacity = if index >= 0 {
-                    (index as usize) + 1
+                    ((index as usize) + 1).min(max_capacity)
                 } else {
-                    (-index) as usize
+                    index.unsigned_abs().min(max_capacity)
                 };
                 let mut array = Vec::with_capacity(capacity);
                 let prev_value = insert(&mut array, index, path_iter, insert_value);
@@ -75,6 +76,42 @@ mod test {
             }
         }));
         assert_eq!(value, expected);
+    }
+
+    // OBE-10735: `insert_value` padded the array with `Value::Null` up to an arbitrary index,
+    // and `Vec::with_capacity(index + 1)` allocated for it up front — an event-controlled path
+    // index was enough to exhaust memory.
+    #[test]
+    fn test_insert_beyond_max_array_index_is_rejected() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[2000000]", 1), None);
+        assert_eq!(value, Value::from(json!([])));
+    }
+
+    #[test]
+    fn test_insert_beyond_max_negative_array_index_is_rejected() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[-2000000]", 1), None);
+        assert_eq!(value, Value::from(json!([])));
+    }
+
+    // `-index` on `isize::MIN` overflows; `unsigned_abs()` must be used instead so this doesn't
+    // panic on the exact class of input the array-index cap is meant to guard against.
+    #[test]
+    fn test_insert_at_isize_min_index_does_not_panic() {
+        let mut value = Value::Null;
+        let path = vec![BorrowedSegment::Index(isize::MIN)].into_iter();
+        assert_eq!(insert(&mut value, (), path, Value::Integer(1)), None);
+        assert_eq!(value, Value::from(json!([])));
+    }
+
+    #[test]
+    fn test_insert_at_max_array_index_is_allowed() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[1048576]", 1), None);
+        let array = value.as_array().expect("expected an array");
+        assert_eq!(array.len(), 1_048_577);
+        assert_eq!(array[1_048_576], Value::Integer(1));
     }
 
     #[test]
