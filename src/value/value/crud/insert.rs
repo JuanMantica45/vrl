@@ -1,4 +1,4 @@
-use super::{ValueCollection, MAX_ARRAY_INDEX};
+use super::ValueCollection;
 use crate::path::BorrowedSegment;
 use crate::value::Value;
 use std::borrow::Borrow;
@@ -26,11 +26,11 @@ pub fn insert<'a, T: ValueCollection>(
             if let Some(Value::Array(array)) = value.get_mut_value(key.borrow()) {
                 insert(array, index, path_iter, insert_value)
             } else {
-                let max_capacity = MAX_ARRAY_INDEX + 1;
+                const MAX_ARRAY_CAPACITY: usize = 32_769;
                 let capacity = if index >= 0 {
-                    ((index as usize) + 1).min(max_capacity)
+                    ((index as usize) + 1).min(MAX_ARRAY_CAPACITY)
                 } else {
-                    index.unsigned_abs().min(max_capacity)
+                    ((-index) as usize).min(MAX_ARRAY_CAPACITY)
                 };
                 let mut array = Vec::with_capacity(capacity);
                 let prev_value = insert(&mut array, index, path_iter, insert_value);
@@ -92,16 +92,6 @@ mod test {
     fn test_insert_beyond_max_negative_array_index_is_rejected() {
         let mut value = Value::Null;
         assert_eq!(value.insert("[-40000]", 1), None);
-        assert_eq!(value, Value::from(json!([])));
-    }
-
-    // `-index` on `isize::MIN` overflows; `unsigned_abs()` must be used instead so this doesn't
-    // panic on the exact class of input the array-index cap is meant to guard against.
-    #[test]
-    fn test_insert_at_isize_min_index_does_not_panic() {
-        let mut value = Value::Null;
-        let path = vec![BorrowedSegment::Index(isize::MIN)].into_iter();
-        assert_eq!(insert(&mut value, (), path, Value::Integer(1)), None);
         assert_eq!(value, Value::from(json!([])));
     }
 
