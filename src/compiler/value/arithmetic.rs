@@ -65,35 +65,11 @@ pub trait VrlValueArithmetic: Sized {
     fn eq_lossy(&self, rhs: &Self) -> bool;
 }
 
-fn safe_sub(lhv: f64, rhv: f64) -> Option<Value> {
-    let result = lhv - rhv;
-    if result.is_nan() {
-        None
-    } else {
-        Some(Value::from_f64_or_zero(result))
-    }
-}
-
-fn safe_add(lhv: f64, rhv: f64) -> Option<Value> {
-    let result = lhv + rhv;
-    if result.is_nan() {
-        None
-    } else {
-        Some(Value::from_f64_or_zero(result))
-    }
-}
-
-fn safe_mul(lhv: f64, rhv: f64) -> Option<Value> {
-    let result = lhv * rhv;
-    if result.is_nan() {
-        None
-    } else {
-        Some(Value::from_f64_or_zero(result))
-    }
-}
-
-fn safe_rem(lhv: f64, rhv: f64) -> Option<Value> {
-    let result = lhv % rhv;
+// `NotNan` permits infinities, so a float operand can legitimately be ±∞ (e.g. produced by an
+// overflowing multiplication). Operations whose result is NaN (e.g. `∞ * 0`, `∞ + -∞`, `∞ % ∞`)
+// used to reach `NotNan`'s arithmetic impls directly, which panic. See OBE-10727.
+fn safe_binop(lhv: f64, rhv: f64, op: impl Fn(f64, f64) -> f64) -> Option<Value> {
+    let result = op(lhv, rhv);
     if result.is_nan() {
         None
     } else {
@@ -135,7 +111,7 @@ impl VrlValueArithmetic for Value {
             }
             Value::Float(lhv) => {
                 let rhs = rhs.try_into_f64().map_err(|_| err())?;
-                safe_mul(*lhv, rhs).ok_or_else(err)?
+                safe_binop(*lhv, rhs, |a, b| a * b).ok_or_else(err)?
             }
             Value::Bytes(lhv) if rhs.is_integer() => {
                 // See the note in the `Integer * Bytes` arm above.
@@ -186,7 +162,8 @@ impl VrlValueArithmetic for Value {
                 let rhs = rhs
                     .try_into_f64()
                     .map_err(|_| ValueError::Add(Kind::float(), rhs.kind()))?;
-                safe_add(*lhs, rhs).ok_or(ValueError::Add(Kind::float(), Kind::float()))?
+                safe_binop(*lhs, rhs, |a, b| a + b)
+                    .ok_or(ValueError::Add(Kind::float(), Kind::float()))?
             }
             (lhs @ Value::Bytes(_), Value::Null) => lhs,
             (Value::Bytes(lhs), Value::Bytes(rhs)) => {
@@ -217,7 +194,7 @@ impl VrlValueArithmetic for Value {
             }
             Value::Float(lhs) => {
                 let rhs = rhs.try_into_f64().map_err(|_| err())?;
-                safe_sub(*lhs, rhs).ok_or_else(err)?
+                safe_binop(*lhs, rhs, |a, b| a - b).ok_or_else(err)?
             }
             _ => return Err(err()),
         };
@@ -282,7 +259,7 @@ impl VrlValueArithmetic for Value {
             }
             Value::Float(lhv) => {
                 let rhv = rhs.try_into_f64().map_err(|_| err())?;
-                safe_rem(*lhv, rhv).ok_or_else(err)?
+                safe_binop(*lhv, rhv, |a, b| a % b).ok_or_else(err)?
             }
             _ => return Err(err()),
         };
