@@ -1,18 +1,11 @@
 use crate::compiler::prelude::*;
 use crate::path::{OwnedSegment, OwnedValuePath};
-
-const MAX_PATH_SEGMENTS: usize = 128;
+use crate::stdlib::util::check_path_segment_limit;
 
 fn set(path: Value, mut value: Value, data: Value) -> Resolved {
     let path = match path {
         Value::Array(segments) => {
-            if segments.len() > MAX_PATH_SEGMENTS {
-                return Err(format!(
-                    "path has {} segments, max is {MAX_PATH_SEGMENTS}",
-                    segments.len()
-                )
-                .into());
-            }
+            check_path_segment_limit(segments.len())?;
 
             let mut insert = OwnedValuePath::root();
 

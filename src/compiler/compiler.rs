@@ -56,7 +56,7 @@ pub struct Compiler<'a> {
     // the error from the LHS)
     fallible_expression_error: Option<CompilerError>,
 
-    /// Current expression nesting depth, incremented on each compile_expr entry.
+    /// Current expression nesting depth, incremented on each `compile_expr` entry.
     depth: u32,
 
     config: CompileConfig,

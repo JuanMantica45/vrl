@@ -1,18 +1,11 @@
 use crate::compiler::prelude::*;
 use crate::path::{OwnedSegment, OwnedValuePath};
-
-const MAX_PATH_SEGMENTS: usize = 128;
+use crate::stdlib::util::check_path_segment_limit;
 
 fn remove(path: Value, compact: Value, mut value: Value) -> Resolved {
     let path = match path {
         Value::Array(path) => {
-            if path.len() > MAX_PATH_SEGMENTS {
-                return Err(format!(
-                    "path has {} segments, max is {MAX_PATH_SEGMENTS}",
-                    path.len()
-                )
-                .into());
-            }
+            check_path_segment_limit(path.len())?;
 
             let mut lookup = OwnedValuePath::root();
 
