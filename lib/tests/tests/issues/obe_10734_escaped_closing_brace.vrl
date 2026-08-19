@@ -1,0 +1,7 @@
+# issue: OBE-10734
+# The lexer accepted `\}` as an escape code, but `unescape_string_literal` had no matching arm
+# and fell through to `unimplemented!("invalid escape")` — a one-character program crashed the
+# compiler.
+# result: "}"
+
+"\}"

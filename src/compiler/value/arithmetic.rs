@@ -1,7 +1,5 @@
 #![deny(clippy::arithmetic_side_effects)]
 
-use std::ops::{Add, Mul, Rem};
-
 use crate::compiler::{
     value::{Kind, VrlValueConvert},
     ExpressionError,
@@ -67,8 +65,11 @@ pub trait VrlValueArithmetic: Sized {
     fn eq_lossy(&self, rhs: &Self) -> bool;
 }
 
-fn safe_sub(lhv: f64, rhv: f64) -> Option<Value> {
-    let result = lhv - rhv;
+// `NotNan` permits infinities, so a float operand can legitimately be ±∞ (e.g. produced by an
+// overflowing multiplication). Operations whose result is NaN (e.g. `∞ * 0`, `∞ + -∞`, `∞ % ∞`)
+// used to reach `NotNan`'s arithmetic impls directly, which panic. See OBE-10727.
+fn safe_binop(lhv: f64, rhv: f64, op: impl Fn(f64, f64) -> f64) -> Option<Value> {
+    let result = op(lhv, rhv);
     if result.is_nan() {
         None
     } else {
@@ -110,7 +111,7 @@ impl VrlValueArithmetic for Value {
             }
             Value::Float(lhv) => {
                 let rhs = rhs.try_into_f64().map_err(|_| err())?;
-                lhv.mul(rhs).into()
+                safe_binop(*lhv, rhs, |a, b| a * b).ok_or_else(err)?
             }
             Value::Bytes(lhv) if rhs.is_integer() => {
                 // See the note in the `Integer * Bytes` arm above.
@@ -161,7 +162,8 @@ impl VrlValueArithmetic for Value {
                 let rhs = rhs
                     .try_into_f64()
                     .map_err(|_| ValueError::Add(Kind::float(), rhs.kind()))?;
-                lhs.add(rhs).into()
+                safe_binop(*lhs, rhs, |a, b| a + b)
+                    .ok_or(ValueError::Add(Kind::float(), Kind::float()))?
             }
             (lhs @ Value::Bytes(_), Value::Null) => lhs,
             (Value::Bytes(lhs), Value::Bytes(rhs)) => {
@@ -192,7 +194,7 @@ impl VrlValueArithmetic for Value {
             }
             Value::Float(lhs) => {
                 let rhs = rhs.try_into_f64().map_err(|_| err())?;
-                safe_sub(*lhs, rhs).ok_or_else(err)?
+                safe_binop(*lhs, rhs, |a, b| a - b).ok_or_else(err)?
             }
             _ => return Err(err()),
         };
@@ -257,7 +259,7 @@ impl VrlValueArithmetic for Value {
             }
             Value::Float(lhv) => {
                 let rhv = rhs.try_into_f64().map_err(|_| err())?;
-                lhv.rem(rhv).into()
+                safe_binop(*lhv, rhv, |a, b| a % b).ok_or_else(err)?
             }
             _ => return Err(err()),
         };
@@ -372,6 +374,8 @@ impl VrlValueArithmetic for Value {
 
 #[cfg(test)]
 mod tests {
+    use ordered_float::NotNan;
+
     use super::*;
 
     // OBE-10736: string * int must not OOM or capacity-overflow abort.
@@ -411,5 +415,45 @@ mod tests {
         let n = Value::Integer(0);
         let result = s.try_mul(n).expect("expected success for zero repeat");
         assert_eq!(result, Value::Bytes(bytes::Bytes::new()));
+    }
+
+    // `NotNan` permits infinities, so a float operand can legitimately be ±∞ (e.g. produced by
+    // an overflowing multiplication, or by `parse_json` on an out-of-range literal). Operations
+    // whose result is NaN used to reach `NotNan`'s `Add`/`Mul`/`Rem` impls, which panic.
+    // See OBE-10727.
+    fn float(v: f64) -> Value {
+        Value::Float(NotNan::new(v).expect("test operand is not NaN"))
+    }
+
+    #[test]
+    fn multiplying_infinity_by_zero_returns_an_error_instead_of_panicking() {
+        assert!(float(f64::INFINITY).try_mul(float(0.0)).is_err());
+        assert!(float(0.0).try_mul(float(f64::NEG_INFINITY)).is_err());
+    }
+
+    #[test]
+    fn adding_opposite_infinities_returns_an_error_instead_of_panicking() {
+        assert!(float(f64::INFINITY)
+            .try_add(float(f64::NEG_INFINITY))
+            .is_err());
+    }
+
+    #[test]
+    fn taking_the_remainder_of_infinity_returns_an_error_instead_of_panicking() {
+        assert!(float(f64::INFINITY).try_rem(float(f64::INFINITY)).is_err());
+        assert!(float(f64::INFINITY).try_rem(float(2.0)).is_err());
+    }
+
+    #[test]
+    fn an_infinite_result_is_still_a_valid_value() {
+        // Only NaN results are rejected — overflow to ±∞ must keep working.
+        assert_eq!(
+            float(f64::MAX).try_mul(float(10.0)),
+            Ok(float(f64::INFINITY))
+        );
+        assert_eq!(
+            float(f64::INFINITY).try_add(float(1.0)),
+            Ok(float(f64::INFINITY))
+        );
     }
 }

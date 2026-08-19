@@ -2439,6 +2439,14 @@ mod test {
         }
     }
 
+    // OBE-10734: the lexer's `escape_code` accepted `\}`, but `unescape_string_literal` had no
+    // matching arm and fell through to `unimplemented!("invalid escape")`.
+    #[test]
+    fn unescape_escaped_closing_brace() {
+        assert_eq!("}", StringLiteralToken(r"\}").unescape());
+        assert_eq!("{}", StringLiteralToken(r"\{\}").unescape());
+    }
+
     #[test]
     fn function_closure_no_arg() {
         test(

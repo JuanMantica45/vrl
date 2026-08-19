@@ -1,6 +1,10 @@
 use crate::value::{KeyString, ObjectMap, Value};
 use std::borrow::Borrow;
 
+/// Largest array index `insert_value` will grow an array to, in either direction.
+/// Prevents an event-controlled index (e.g. `.foo[40000000] = 1`) from exhausting memory.
+const MAX_ARRAY_INDEX: usize = 32_768;
+
 mod get;
 mod get_mut;
 mod insert;
@@ -104,6 +108,19 @@ impl ValueCollection for Vec<Value> {
     }
 
     fn insert_value(&mut self, key: isize, value: Value) -> Option<Value> {
+        let max_index = MAX_ARRAY_INDEX as isize;
+        if !(-max_index..=max_index).contains(&key) {
+            // TODO: VRL-side array-index assignment is currently infallible (see
+            // compiler::expression::assignment::Target::insert), so we can't surface this as a
+            // proper VRL runtime error without a larger change. Log it so it's at least
+            // observable instead of a silent no-op.
+            tracing::warn!(
+                index = key,
+                max_index = MAX_ARRAY_INDEX,
+                "array index assignment out of range, write dropped"
+            );
+            return None;
+        }
         if key >= 0 {
             if self.len() <= (key as usize) {
                 while self.len() <= (key as usize) {

@@ -26,10 +26,11 @@ pub fn insert<'a, T: ValueCollection>(
             if let Some(Value::Array(array)) = value.get_mut_value(key.borrow()) {
                 insert(array, index, path_iter, insert_value)
             } else {
+                const MAX_ARRAY_CAPACITY: usize = 32_769;
                 let capacity = if index >= 0 {
-                    (index as usize) + 1
+                    ((index as usize) + 1).min(MAX_ARRAY_CAPACITY)
                 } else {
-                    (-index) as usize
+                    ((-index) as usize).min(MAX_ARRAY_CAPACITY)
                 };
                 let mut array = Vec::with_capacity(capacity);
                 let prev_value = insert(&mut array, index, path_iter, insert_value);
@@ -75,6 +76,32 @@ mod test {
             }
         }));
         assert_eq!(value, expected);
+    }
+
+    // OBE-10735: `insert_value` padded the array with `Value::Null` up to an arbitrary index,
+    // and `Vec::with_capacity(index + 1)` allocated for it up front — an event-controlled path
+    // index was enough to exhaust memory.
+    #[test]
+    fn test_insert_beyond_max_array_index_is_rejected() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[40000]", 1), None);
+        assert_eq!(value, Value::from(json!([])));
+    }
+
+    #[test]
+    fn test_insert_beyond_max_negative_array_index_is_rejected() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[-40000]", 1), None);
+        assert_eq!(value, Value::from(json!([])));
+    }
+
+    #[test]
+    fn test_insert_at_max_array_index_is_allowed() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[32768]", 1), None);
+        let array = value.as_array().expect("expected an array");
+        assert_eq!(array.len(), 32769);
+        assert_eq!(array[32768], Value::Integer(1));
     }
 
     #[test]
