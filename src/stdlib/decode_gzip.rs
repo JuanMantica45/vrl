@@ -1,16 +1,20 @@
 use crate::compiler::prelude::*;
+use crate::stdlib::util::{DECOMPRESS_LIMIT_ERROR, DEFAULT_DECOMPRESS_LIMIT};
 use flate2::read::MultiGzDecoder;
 use std::io::Read;
+
 
 fn decode_gzip(value: Value) -> Resolved {
     let value = value.try_bytes()?;
     let mut buf = Vec::new();
-    let result = MultiGzDecoder::new(std::io::Cursor::new(value)).read_to_end(&mut buf);
-
-    match result {
-        Ok(_) => Ok(Value::Bytes(buf.into())),
-        Err(_) => Err("unable to decode value with Gzip decoder".into()),
+    MultiGzDecoder::new(std::io::Cursor::new(value))
+        .take(DEFAULT_DECOMPRESS_LIMIT + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| "unable to decode value with Gzip decoder")?;
+    if buf.len() as u64 > DEFAULT_DECOMPRESS_LIMIT {
+        return Err(DECOMPRESS_LIMIT_ERROR.into());
     }
+    Ok(Value::Bytes(buf.into()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,4 +101,21 @@ mod tests {
             tdef: TypeDef::bytes().fallible(),
         }
     ];
+
+    // OBE-10737: a gzip bomb that decompresses to >64 MiB must return an error.
+    #[test]
+    fn gzip_bomb_exceeds_limit() {
+        // Compress 65 MiB of zeros — zeros compress to <1 KiB with gzip.
+        let zeros = vec![0u8; 65 * 1024 * 1024];
+        let mut compressed = Vec::new();
+        let mut enc = GzEncoder::new(zeros.as_slice(), flate2::Compression::best());
+        enc.read_to_end(&mut compressed).unwrap();
+
+        let result = decode_gzip(Value::Bytes(compressed.into()));
+        assert!(result.is_err(), "expected error for gzip bomb exceeding size limit");
+        assert!(
+            result.unwrap_err().to_string().contains("exceeds size limit"),
+            "error should mention size limit"
+        );
+    }
 }

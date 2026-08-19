@@ -11,6 +11,14 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use super::ValueError;
 
+/// Maximum byte length of a string produced by the `*` (repeat) operator.
+/// Prevents OOM when an attacker supplies a large integer multiplier (OBE-10736).
+///
+/// `pub(crate)` so `compiler::expression::op` can compare a literal multiplier
+/// against it at compile time (a literal count above this can never succeed,
+/// regardless of operand length, so it's always marked fallible).
+pub(crate) const MAX_REPEAT_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
 pub trait VrlValueArithmetic: Sized {
     /// Similar to [`std::ops::Mul`], but fallible (e.g. `TryMul`).
     fn try_mul(self, rhs: Self) -> Result<Self, ValueError>;
@@ -75,11 +83,23 @@ impl VrlValueArithmetic for Value {
 
         // When multiplying a string by an integer, if the number is negative we set it to zero to
         // return an empty string.
-        let as_usize = |num| if num < 0 { 0 } else { num as usize };
+        let as_usize = |num: i64| if num < 0 { 0 } else { num as usize };
 
         let value = match self {
             Value::Integer(lhv) if rhs.is_bytes() => {
-                Bytes::from(rhs.try_bytes()?.repeat(as_usize(lhv))).into()
+                // `try_bytes` consumes `rhs`, so the `err` closure above (which borrows
+                // it) cannot be used past this point. Both operand kinds are known
+                // exactly in this arm, so build the error from them directly rather than
+                // deriving `Kind` from the values — `Kind::from(&Value)` deep-walks
+                // containers, and doing that eagerly would cost every multiplication.
+                let repeat_err = || ValueError::Mul(Kind::integer(), Kind::bytes());
+                let bytes = rhs.try_bytes()?;
+                let n = as_usize(lhv);
+                let out_len = bytes.len().checked_mul(n).ok_or_else(repeat_err)?;
+                if out_len > MAX_REPEAT_BYTES {
+                    return Err(repeat_err());
+                }
+                Bytes::from(bytes.repeat(n)).into()
             }
             Value::Integer(lhv) if rhs.is_float() => {
                 Value::from_f64_or_zero(lhv as f64 * rhs.try_float()?)
@@ -93,7 +113,14 @@ impl VrlValueArithmetic for Value {
                 lhv.mul(rhs).into()
             }
             Value::Bytes(lhv) if rhs.is_integer() => {
-                Bytes::from(lhv.repeat(as_usize(rhs.try_integer()?))).into()
+                // See the note in the `Integer * Bytes` arm above.
+                let repeat_err = || ValueError::Mul(Kind::bytes(), Kind::integer());
+                let n = as_usize(rhs.try_integer()?);
+                let out_len = lhv.len().checked_mul(n).ok_or_else(repeat_err)?;
+                if out_len > MAX_REPEAT_BYTES {
+                    return Err(repeat_err());
+                }
+                Bytes::from(lhv.repeat(n)).into()
             }
             _ => return Err(err()),
         };
@@ -340,5 +367,49 @@ impl VrlValueArithmetic for Value {
 
             _ => self == rhs,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // OBE-10736: string * int must not OOM or capacity-overflow abort.
+
+    #[test]
+    fn try_mul_bytes_large_count_returns_error() {
+        let s = Value::Bytes(bytes::Bytes::from("a"));
+        let n = Value::Integer(64 * 1024 * 1024 + 1);
+        assert!(s.try_mul(n).is_err(), "expected error for repeat count exceeding MAX_REPEAT_BYTES");
+    }
+
+    #[test]
+    fn try_mul_bytes_overflow_count_returns_error() {
+        let s = Value::Bytes(bytes::Bytes::from_static(b"aaaa")); // len = 4
+        let n = Value::Integer(i64::MAX); // 4 * i64::MAX overflows usize on 64-bit
+        assert!(s.try_mul(n).is_err(), "expected error on checked_mul overflow");
+    }
+
+    #[test]
+    fn try_mul_int_bytes_large_count_returns_error() {
+        let n = Value::Integer(64 * 1024 * 1024 + 1);
+        let s = Value::Bytes(bytes::Bytes::from("b"));
+        assert!(n.try_mul(s).is_err(), "expected error for int * bytes exceeding MAX_REPEAT_BYTES");
+    }
+
+    #[test]
+    fn try_mul_bytes_small_count_succeeds() {
+        let s = Value::Bytes(bytes::Bytes::from("ab"));
+        let n = Value::Integer(3);
+        let result = s.try_mul(n).expect("expected success for small repeat");
+        assert_eq!(result, Value::Bytes(bytes::Bytes::from("ababab")));
+    }
+
+    #[test]
+    fn try_mul_bytes_zero_count_returns_empty() {
+        let s = Value::Bytes(bytes::Bytes::from("hello"));
+        let n = Value::Integer(0);
+        let result = s.try_mul(n).expect("expected success for zero repeat");
+        assert_eq!(result, Value::Bytes(bytes::Bytes::new()));
     }
 }

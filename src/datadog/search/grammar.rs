@@ -242,9 +242,12 @@ impl QueryVisitor {
                                     ) => match (lc, rc) {
                                         (Comparison::Gte, Comparison::Lte) => (true, lv, rv, true),
                                         (Comparison::Gt, Comparison::Lt) => (false, lv, rv, false),
-                                        _ => panic!("invalid range comparison"),
+                                        // Mixed-bracket ranges: [lo TO hi} or {lo TO hi]
+                                        (Comparison::Gte, Comparison::Lt) => (true, lv, rv, false),
+                                        (Comparison::Gt, Comparison::Lte) => (false, lv, rv, true),
+                                        _ => unreachable!("grammar only produces Gt/Gte left and Lt/Lte right"),
                                     },
-                                    _ => panic!("invalid range value"),
+                                    _ => unreachable!("grammar always emits bracket, value, value, bracket"),
                                 };
 
                             return QueryNode::AttributeRange {

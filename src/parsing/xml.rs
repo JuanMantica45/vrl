@@ -1,5 +1,8 @@
 use crate::compiler::prelude::*;
 use once_cell::sync::Lazy;
+
+// OBE-10742: bound recursion depth to prevent stack overflow on deeply-nested XML.
+const MAX_XML_DEPTH: u32 = 128;
 use regex::{Regex, RegexBuilder};
 use roxmltree::{Document, Node, NodeType};
 use rust_decimal::prelude::Zero;
@@ -91,14 +94,17 @@ pub(crate) fn parse_xml(value: Value, options: ParseOptions) -> Resolved {
     // Trim whitespace around XML elements, if applicable.
     let parse = if trim { trim_xml(&string) } else { string };
     let doc = Document::parse(&parse).map_err(|e| format!("unable to parse xml: {e}"))?;
-    let value = process_node(doc.root(), &config);
-    Ok(value)
+    process_node(doc.root(), &config, 0)
 }
 
 /// Process an XML node, and return a VRL `Value`.
-fn process_node(node: Node, config: &ParseXmlConfig) -> Value {
+fn process_node(node: Node, config: &ParseXmlConfig, depth: u32) -> Resolved {
+    if depth > MAX_XML_DEPTH {
+        return Err(format!("xml nesting limit ({MAX_XML_DEPTH}) exceeded").into());
+    }
+
     // Helper to recurse over a `Node`s children, and build an object.
-    let recurse = |node: Node| -> ObjectMap {
+    let recurse = |node: Node| -> Result<ObjectMap, ExpressionError> {
         let mut map = BTreeMap::new();
 
         // Expand attributes, if required.
@@ -119,7 +125,7 @@ fn process_node(node: Node, config: &ParseXmlConfig) -> Value {
             };
 
             // Transform the node into a VRL `Value`.
-            let value = process_node(n, config);
+            let value = process_node(n, config, depth + 1)?;
 
             // If the key already exists, add it. Otherwise, insert.
             match map.entry(name) {
@@ -143,11 +149,11 @@ fn process_node(node: Node, config: &ParseXmlConfig) -> Value {
             }
         }
 
-        map
+        Ok(map)
     };
 
     match node.node_type() {
-        NodeType::Root => Value::Object(recurse(node)),
+        NodeType::Root => Ok(Value::Object(recurse(node)?)),
 
         NodeType::Element => {
             match (
@@ -155,45 +161,52 @@ fn process_node(node: Node, config: &ParseXmlConfig) -> Value {
                 node.attributes().len().is_zero(),
             ) {
                 // If the node has attributes, *always* recurse to expand default keys.
-                (_, false) if config.include_attr => Value::Object(recurse(node)),
+                (_, false) if config.include_attr => Ok(Value::Object(recurse(node)?)),
                 // If a text key should be used, always recurse.
-                (true, true) => Value::Object(recurse(node)),
-                // Otherwise, check the node count to determine what to do.
-                _ => match node.children().count() {
-                    // For a single node, 'flatten' the object if necessary.
-                    1 => {
-                        // Expect a single element.
-                        let node = node.children().next().expect("expected 1 XML node");
+                (true, true) => Ok(Value::Object(recurse(node)?)),
+                // Otherwise, check the (real) node count to determine what to do.
+                // Counting only element/text children — same filter `recurse`
+                // uses — keeps a comment/PI sibling from inflating the count
+                // and skipping the single-child flatten path below. Peeking two
+                // items (rather than collecting) avoids allocating for the
+                // common 0- or 2+-child cases, which fall straight through to
+                // `recurse` anyway.
+                _ => {
+                    let mut real_children =
+                        node.children().filter(|n| n.is_element() || n.is_text());
+                    match (real_children.next(), real_children.next()) {
+                        // Exactly one real child: 'flatten' the object if necessary.
+                        (Some(node), None) => {
+                            // If the node is an element, treat it as an object.
+                            if node.is_element() {
+                                let mut map = BTreeMap::new();
 
-                        // If the node is an element, treat it as an object.
-                        if node.is_element() {
-                            let mut map = BTreeMap::new();
+                                map.insert(
+                                    node.tag_name().name().to_string().into(),
+                                    process_node(node, config, depth + 1)?,
+                                );
 
-                            map.insert(
-                                node.tag_name().name().to_string().into(),
-                                process_node(node, config),
-                            );
-
-                            Value::Object(map)
-                        } else if node.is_text() {
-                            // 'Flatten' the object by continuing processing.
-                            process_node(node, config)
-                        } else {
-                            // Comment or PI as the sole child — return empty object
-                            // rather than forwarding into process_node where it would
-                            // hit an unreachable arm.
-                            Value::Object(BTreeMap::new())
+                                Ok(Value::Object(map))
+                            } else {
+                                // Only Text can reach here — the filter above
+                                // excludes Comment/PI.
+                                process_node(node, config, depth + 1)
+                            }
                         }
+                        // 0 or 2+ real children: expand (0 real children yields
+                        // an empty object, e.g. a comment/PI-only element).
+                        _ => Ok(Value::Object(recurse(node)?)),
                     }
-                    // For 2+ nodes, expand.
-                    _ => Value::Object(recurse(node)),
-                },
+                }
             }
         }
-        NodeType::Text => process_text(node.text().expect("expected XML text node"), config),
+        NodeType::Text => Ok(process_text(
+            node.text().expect("expected XML text node"),
+            config,
+        )),
         // Comment and PI nodes are skipped by the multi-child filter; reaching here
         // means a caller forwarded one directly. Return empty object rather than panic.
-        NodeType::Comment | NodeType::PI => Value::Object(BTreeMap::new()),
+        NodeType::Comment | NodeType::PI => Ok(Value::Object(BTreeMap::new())),
     }
 }
 

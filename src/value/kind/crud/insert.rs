@@ -1,8 +1,50 @@
 //! All types related to inserting one [`Kind`] into another.
 
 use crate::path::{BorrowedSegment, ValuePath};
-use crate::value::kind::Collection;
+use crate::value::kind::{Collection, Index};
 use crate::value::Kind;
+
+/// Largest number of `known` array entries this module will materialize while
+/// modelling an array index (OBE-10721).
+///
+/// Array index insertion normally records one `known` entry per index between
+/// the existing entries and the target index, so an index such as `-99999999`
+/// would allocate ~100M `Kind`s and exhaust memory *at compile time*. Beyond
+/// this threshold we stop enumerating and widen the collection instead — see
+/// [`collapse_array_to_unknown`].
+const MAX_KNOWN_INDEX_ENTRIES: usize = 128;
+
+/// Replace a precise, per-index array type with an imprecise but sound one.
+///
+/// Every `known` entry is folded into the `unknown` kind, together with `null`
+/// (extending an array to reach the index creates null holes) and the kind
+/// resulting from the insertion itself. Callers use this when enumerating the
+/// indices individually would exhaust memory.
+///
+/// This only ever *widens* the type: each index that previously had a precise
+/// `known` kind is now described by an `unknown` that is a superset of it. That
+/// makes later expressions more fallible, never less, so it cannot mask a
+/// type error.
+fn collapse_array_to_unknown<'b>(
+    collection: &mut Collection<Index>,
+    iter: impl Iterator<Item = BorrowedSegment<'b>> + Clone,
+    kind: Kind,
+) {
+    let mut widened = collection.unknown_kind();
+    for known_kind in collection.known().values() {
+        widened = widened.union(known_kind.clone());
+    }
+    // Holes created by extending the array to reach the index.
+    widened = widened.union(Kind::null());
+
+    // The insertion may land on any index in the collapsed range.
+    let mut with_insertion = widened.clone();
+    with_insertion.insert_recursive(iter, kind);
+    widened = widened.union(with_insertion);
+
+    collection.known_mut().clear();
+    collection.set_unknown(widened);
+}
 
 impl Kind {
     /// Insert the `Kind` at the given `path` within `self`.
@@ -58,10 +100,25 @@ impl Kind {
                     *self = Self::array(self.array.clone().unwrap_or_else(Collection::empty));
                     let collection = self.array.as_mut().expect("array was just inserted");
 
+                    // OBE-10721: every branch below records one `known` entry per index
+                    // between the existing entries and `index`. For a far-away index that
+                    // exhausts memory (and time) at compile time, so widen instead of
+                    // enumerating. `unsigned_abs` also avoids the `-index` overflow that
+                    // `isize::MIN` would otherwise cause.
+                    let indices_required = if index < 0 {
+                        index.unsigned_abs()
+                    } else {
+                        (index as usize).saturating_add(1)
+                    };
+                    if indices_required > MAX_KNOWN_INDEX_ENTRIES {
+                        collapse_array_to_unknown(collection, iter, kind);
+                        return;
+                    }
+
                     if index < 0 {
                         let largest_known_index = collection.largest_known_index();
                         // The minimum size of the resulting array.
-                        let len_required = -index as usize;
+                        let len_required = index.unsigned_abs();
 
                         let unknown_kind = collection.unknown_kind();
                         if unknown_kind.contains_any_defined() {
@@ -646,6 +703,66 @@ mod tests {
         ] {
             this.insert(&path, kind);
             assert_eq!(this, expected, "{title}");
+        }
+    }
+
+    // OBE-10721: a far-away index must not OOM/hang the type-checker, in any of the
+    // three branches that materialize one `known` entry per index. Each of these
+    // enumerated ~100M entries before the fix. The wall-clock bound is the real
+    // assertion — unfixed, each of these takes hours.
+    #[test]
+    fn far_away_index_does_not_oom() {
+        let cases: Vec<(&str, Kind, i64)> = vec![
+            // Negative index, collection has a defined `unknown` (shift-simulation path).
+            (
+                "negative with unknown",
+                Kind::array(Collection::empty().with_unknown(Kind::integer())),
+                -99_999_999,
+            ),
+            // Negative index, no `unknown` (exact-position hole-fill path).
+            (
+                "negative without unknown",
+                Kind::array(Collection::from_parts(
+                    [(0.into(), Kind::integer()), (1.into(), Kind::integer())].into(),
+                    Kind::undefined(),
+                )),
+                -99_999_999,
+            ),
+            // Positive index (hole-fill path).
+            ("positive", Kind::array(Collection::empty()), 99_999_999),
+        ];
+
+        for (name, mut kind, index) in cases {
+            let start = std::time::Instant::now();
+            kind.insert(&owned_value_path!(index as isize), Kind::bytes());
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "{name}: insert took {elapsed:?}, expected well under 5s"
+            );
+
+            let arr = kind.as_array().expect("result is an array");
+            assert!(
+                arr.known().len() <= MAX_KNOWN_INDEX_ENTRIES,
+                "{}: expected at most {} known entries, got {}",
+                name,
+                MAX_KNOWN_INDEX_ENTRIES,
+                arr.known().len()
+            );
+
+            // Soundness: the collapsed `unknown` must still admit everything that
+            // could really be at those indices — the inserted kind, the null holes,
+            // and any kind that was previously known.
+            let unknown = arr.unknown_kind();
+            assert!(
+                unknown.contains_bytes(),
+                "{name}: collapsed unknown must admit the inserted bytes kind"
+            );
+            assert!(
+                unknown.contains_null(),
+                "{name}: collapsed unknown must admit null holes"
+            );
         }
     }
 }

@@ -1,6 +1,17 @@
 use crate::compiler::{Context, Expression, Resolved, TypeState};
 use crate::value::{KeyString, ObjectMap, Value};
 
+/// Maximum number of bytes any `decode_*` decompression function will produce
+/// (OBE-10737).
+///
+/// Compressed formats let a tiny input expand enormously ("decompression
+/// bombs"), so every decoder caps its output at this size and returns a
+/// recoverable error rather than exhausting memory.
+pub(crate) const DEFAULT_DECOMPRESS_LIMIT: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// Error returned when a decoder's output would exceed [`DEFAULT_DECOMPRESS_LIMIT`].
+pub(crate) const DECOMPRESS_LIMIT_ERROR: &str = "decompressed output exceeds size limit";
+
 /// Rounds the given number to the given precision.
 /// Takes a function parameter so the exact rounding function (ceil, floor or round)
 /// can be specified.

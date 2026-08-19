@@ -1,14 +1,21 @@
 use crate::compiler::prelude::*;
+use crate::stdlib::util::{DECOMPRESS_LIMIT_ERROR, DEFAULT_DECOMPRESS_LIMIT};
 use nom::AsBytes;
+use std::io::Read;
+
 
 fn decode_zstd(value: Value) -> Resolved {
     let value = value.try_bytes()?;
-    let result = zstd::decode_all(value.as_bytes());
-
-    match result {
-        Ok(decoded_bytes) => Ok(Value::Bytes(decoded_bytes.into())),
-        Err(_) => Err("unable to decode value with Zstd decoder".into()),
+    let mut buf = Vec::new();
+    zstd::Decoder::new(std::io::Cursor::new(value.as_bytes()))
+        .map_err(|_| "unable to decode value with Zstd decoder")?
+        .take(DEFAULT_DECOMPRESS_LIMIT + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| "unable to decode value with Zstd decoder")?;
+    if buf.len() as u64 > DEFAULT_DECOMPRESS_LIMIT {
+        return Err(DECOMPRESS_LIMIT_ERROR.into());
     }
+    Ok(Value::Bytes(buf.into()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,4 +100,18 @@ mod tests {
             tdef: TypeDef::bytes().fallible(),
         }
     ];
+
+    // OBE-10737: a zstd bomb that decompresses to >64 MiB must return an error.
+    #[test]
+    fn zstd_bomb_exceeds_limit() {
+        let zeros = vec![0u8; 65 * 1024 * 1024];
+        let compressed = zstd::encode_all(zeros.as_slice(), 22).expect("zstd encode failed");
+
+        let result = decode_zstd(Value::Bytes(compressed.into()));
+        assert!(result.is_err(), "expected error for zstd bomb exceeding size limit");
+        assert!(
+            result.unwrap_err().to_string().contains("exceeds size limit"),
+            "error should mention size limit"
+        );
+    }
 }

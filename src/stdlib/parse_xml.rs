@@ -276,15 +276,11 @@ mod tests {
             tdef: type_def(),
         }
 
+        // The sole real child is text ("text123"); the leading PI is not a
+        // real child, so this flattens the same as `<p>text123</p>` would.
         header_inside_element {
             args: func_args![ value: "<p><?xml?>text123</p>" ],
-            want: Ok(value!(
-                {
-                    "p": {
-                        "text": "text123"
-                    }
-                }
-            )),
+            want: Ok(value!({ "p": "text123" })),
             tdef: type_def(),
         }
 
@@ -500,7 +496,48 @@ mod tests {
             want: Ok(value!({ "r": { "inner": {} } })),
             tdef: type_def(),
         }
+
+        // A comment sibling next to the sole real (text) child must not change
+        // the flatten decision — the count that picks the single-child fast
+        // path must be over real children only, not raw XML nodes.
+        flatten_text_with_comment_sibling {
+            args: func_args![value: "<a>5<!-- note --></a>"],
+            want: Ok(value!({ "a": 5 })),
+            tdef: type_def(),
+        }
+
+        // Same as above, for a sole real (element) child.
+        flatten_element_with_comment_sibling {
+            args: func_args![value: "<a><!-- note --><b/></a>"],
+            want: Ok(value!({ "a": { "b": {} } })),
+            tdef: type_def(),
+        }
     ];
+
+    // OBE-10742: deeply-nested XML must return an error, not overflow the stack.
+    #[test]
+    fn deeply_nested_xml_returns_error() {
+        // Build <a><a><a>...</a></a></a> with 200 levels — exceeds MAX_XML_DEPTH (128).
+        let open: String = "<a>".repeat(200);
+        let close: String = "</a>".repeat(200);
+        let xml = format!("{}{}", open, close);
+        let result = parse_xml(
+            Value::Bytes(xml.into()),
+            ParseOptions {
+                trim: None,
+                include_attr: None,
+                attr_prefix: None,
+                text_key: None,
+                always_use_text_key: None,
+                parse_bool: None,
+                parse_null: None,
+                parse_number: None,
+            },
+        );
+        assert!(result.is_err(), "expected error for XML exceeding depth limit");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("nesting limit"), "error should mention nesting limit; got: {msg}");
+    }
 
     #[test]
     fn test_kind() {

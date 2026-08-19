@@ -505,6 +505,39 @@ mod tests {
         }
     }
 
+    // OBE-10726: mixed-bracket ranges ([lo TO hi} and {lo TO hi]) must not panic.
+    #[test]
+    fn parses_mixed_bracket_range_inclusive_lower() {
+        let res = parse("foo:[10 TO 20}");
+        assert!(
+            matches!(res,
+            QueryNode::AttributeRange {
+                ref attr,
+                lower_inclusive: true,
+                upper_inclusive: false,
+                ..
+            } if attr == "foo"),
+            "expected inclusive lower, exclusive upper; got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn parses_mixed_bracket_range_exclusive_lower() {
+        let res = parse("foo:{10 TO 20]");
+        assert!(
+            matches!(res,
+            QueryNode::AttributeRange {
+                ref attr,
+                lower_inclusive: false,
+                upper_inclusive: true,
+                ..
+            } if attr == "foo"),
+            "expected exclusive lower, inclusive upper; got {:?}",
+            res
+        );
+    }
+
     #[test]
     fn parses_match_no_docs_query() {
         let cases = [

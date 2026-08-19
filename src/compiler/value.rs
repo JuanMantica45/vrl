@@ -7,4 +7,5 @@ pub use crate::value::value::{IterItem, ObjectMap};
 pub use error::ValueError;
 pub use kind::{Collection, Field, Index, Kind};
 
+pub(crate) use self::arithmetic::MAX_REPEAT_BYTES;
 pub use self::{arithmetic::VrlValueArithmetic, convert::VrlValueConvert};

@@ -115,12 +115,19 @@ impl ValueCollection for Vec<Value> {
                 Some(std::mem::replace(&mut self[key as usize], value))
             }
         } else {
-            let len_required = -key as usize;
+            // `unsigned_abs` rather than `-key`, which overflows on `isize::MIN`.
+            let len_required = key.unsigned_abs();
             if self.len() < len_required {
-                while self.len() < (len_required - 1) {
-                    self.insert(0, Value::Null);
-                }
-                self.insert(0, value);
+                // Prepend the value followed by the null holes needed to reach
+                // `len_required`. Building this in one pass keeps the operation
+                // O(n); repeated `insert(0, ..)` calls are O(n²) and turn a large
+                // negative index into a hang (OBE-10721).
+                let holes = len_required - 1 - self.len();
+                let mut extended = Self::with_capacity(len_required);
+                extended.push(value);
+                extended.extend(std::iter::repeat(Value::Null).take(holes));
+                extended.append(self);
+                *self = extended;
                 None
             } else {
                 let index = (self.len() as isize + key) as usize;

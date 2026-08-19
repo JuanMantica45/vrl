@@ -1,12 +1,22 @@
 use crate::compiler::prelude::*;
-use snap::raw::Decoder;
+use crate::stdlib::util::{DECOMPRESS_LIMIT_ERROR, DEFAULT_DECOMPRESS_LIMIT};
+use snap::raw::{decompress_len, Decoder};
 
 fn decode_snappy(value: Value) -> Resolved {
     let value = value.try_bytes()?;
-    let mut decoder = Decoder::new();
-    let result = decoder.decompress_vec(&value);
 
-    match result {
+    // A snappy frame declares its uncompressed length up front, and
+    // `decompress_vec` sizes its output buffer from that value before doing any
+    // work. A few bytes of input can therefore claim gigabytes, so reject an
+    // over-limit claim before allocating anything (OBE-10737).
+    let claimed_len =
+        decompress_len(&value).map_err(|_| "unable to decode value with Snappy decoder")?;
+    if claimed_len as u64 > DEFAULT_DECOMPRESS_LIMIT {
+        return Err(DECOMPRESS_LIMIT_ERROR.into());
+    }
+
+    let mut decoder = Decoder::new();
+    match decoder.decompress_vec(&value) {
         Ok(buf) => Ok(Value::Bytes(buf.into())),
         Err(_) => Err("unable to decode value with Snappy decoder".into()),
     }
@@ -97,4 +107,46 @@ mod tests {
             tdef: TypeDef::bytes().fallible(),
         }
     ];
+
+    // OBE-10737: a snappy frame that *claims* a huge uncompressed length must be
+    // rejected before the output buffer is allocated. Unfixed, `decompress_vec`
+    // eagerly allocates the claimed size from this handful of input bytes.
+    //
+    // The claim is 1 GiB: comfortably above DEFAULT_DECOMPRESS_LIMIT but below
+    // snap's own `u32::MAX` ceiling, so snap itself will not reject it — our
+    // check is the only thing standing between this input and a 1 GiB alloc.
+    #[test]
+    fn snappy_oversized_claimed_length_rejected() {
+        // A snappy stream begins with the uncompressed length as a varint.
+        let mut payload = Vec::new();
+        let mut claim: u64 = 1024 * 1024 * 1024;
+        while claim >= 0x80 {
+            payload.push((claim as u8) | 0x80);
+            claim >>= 7;
+        }
+        payload.push(claim as u8);
+        // Body is deliberately truncated — we must fail on the size claim, not
+        // by decoding to completion.
+        payload.extend_from_slice(&[0x00, 0x00, 0x00]);
+
+        let result = decode_snappy(Value::Bytes(payload.into()));
+        assert!(result.is_err(), "oversized claimed length must be rejected");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            DECOMPRESS_LIMIT_ERROR,
+            "must be rejected for exceeding the size limit, not as a decode error"
+        );
+    }
+
+    // A real snappy payload well under the limit must still round-trip.
+    #[test]
+    fn snappy_under_limit_still_decodes() {
+        let original = vec![b'a'; 1024 * 1024];
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&original)
+            .expect("snappy encode failed");
+
+        let result = decode_snappy(Value::Bytes(compressed.into())).expect("must decode");
+        assert_eq!(result, Value::Bytes(original.into()));
+    }
 }
