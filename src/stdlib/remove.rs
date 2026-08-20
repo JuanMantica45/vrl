@@ -1,9 +1,12 @@
 use crate::compiler::prelude::*;
 use crate::path::{OwnedSegment, OwnedValuePath};
+use crate::stdlib::util::check_path_segment_limit;
 
 fn remove(path: Value, compact: Value, mut value: Value) -> Resolved {
     let path = match path {
         Value::Array(path) => {
+            check_path_segment_limit(path.len())?;
+
             let mut lookup = OwnedValuePath::root();
 
             for segment in path {
@@ -212,4 +215,15 @@ mod tests {
             tdef: TypeDef::object(Collection::any()).fallible(),
         }
     ];
+
+    #[test]
+    fn test_path_length_limit_obe10739() {
+        // OBE-10739: attacker-controlled path with > MAX_PATH_SEGMENTS segments must be rejected.
+        // Without the fix this returns Ok and silently accepts arbitrary-depth traversal.
+        let segments: Vec<Value> = (0..200).map(|i| Value::Bytes(format!("k{i}").into())).collect();
+        let result = remove(Value::Array(segments), Value::Boolean(false), Value::Object(ObjectMap::new()));
+        assert!(result.is_err(), "path with 200 segments must be rejected (OBE-10739)");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("200 segments"), "error should name the count: {msg}");
+    }
 }

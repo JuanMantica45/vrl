@@ -4,25 +4,32 @@ use crate::compiler::prelude::*;
 
 static DEFAULT_SEPARATOR: &str = ".";
 
+const MAX_UNFLATTEN_DEPTH: usize = 128;
+
 fn unflatten(value: Value, separator: Value, recursive: Value) -> Resolved {
     let separator = separator.try_bytes_utf8_lossy()?.into_owned();
     let recursive = recursive.try_boolean()?;
     let map = value.try_object()?;
-    Ok(do_unflatten(map.into(), &separator, recursive))
+    Ok(do_unflatten(map.into(), &separator, recursive, 0))
 }
 
-fn do_unflatten(value: Value, separator: &str, recursive: bool) -> Value {
+fn do_unflatten(value: Value, separator: &str, recursive: bool, depth: usize) -> Value {
     match value {
-        Value::Object(map) => do_unflatten_entries(map, separator, recursive).into(),
+        Value::Object(map) => do_unflatten_entries(map, separator, recursive, depth).into(),
         // Note that objects inside arrays are not unflattened
         _ => value,
     }
 }
 
-fn do_unflatten_entries<I>(entries: I, separator: &str, recursive: bool) -> ObjectMap
+fn do_unflatten_entries<I>(entries: I, separator: &str, recursive: bool, depth: usize) -> ObjectMap
 where
     I: IntoIterator<Item = (KeyString, Value)>,
 {
+    if depth >= MAX_UNFLATTEN_DEPTH {
+        // Stop splitting keys at the depth limit; collect remainder as literal keys.
+        return entries.into_iter().collect();
+    }
+
     let grouped = entries
         .into_iter()
         .map(|(key, value)| {
@@ -41,14 +48,15 @@ where
                 match values.pop().expect("exactly one element") {
                     (_, None, value) => {
                         let value = if recursive {
-                            do_unflatten(value, separator, recursive)
+                            do_unflatten(value, separator, recursive, depth + 1)
                         } else {
                             value
                         };
                         return (key, value);
                     }
                     (_, Some(rest), value) => {
-                        let result = do_unflatten_entry((rest, value), separator, recursive);
+                        let result =
+                            do_unflatten_entry((rest, value), separator, recursive, depth + 1);
                         return (key, result);
                     }
                 }
@@ -72,7 +80,7 @@ where
                     rest.map(|rest| (rest, value))
                 })
                 .collect::<Vec<_>>();
-            let result = do_unflatten_entries(new_entries, separator, recursive);
+            let result = do_unflatten_entries(new_entries, separator, recursive, depth + 1);
             (key, result.into())
         })
         .collect()
@@ -81,11 +89,22 @@ where
 // Optimization in the case we have to flatten objects like
 // { "a.b.c.d": 1 }
 // and avoid doing recursive calls to `do_unflatten_entries` with a single entry every time
-fn do_unflatten_entry(entry: (KeyString, Value), separator: &str, recursive: bool) -> Value {
+fn do_unflatten_entry(
+    entry: (KeyString, Value),
+    separator: &str,
+    recursive: bool,
+    depth: usize,
+) -> Value {
     let (key, value) = entry;
-    let keys = key.split(separator).map(Into::into).collect::<Vec<_>>();
+    // splitn caps the segment count at the depth budget remaining after `depth`; the final
+    // piece retains any remaining separator characters as a literal key (OBE-10744).
+    let remaining = MAX_UNFLATTEN_DEPTH.saturating_sub(depth);
+    let keys: Vec<KeyString> = key
+        .splitn(remaining + 1, separator)
+        .map(Into::into)
+        .collect();
     let mut result = if recursive {
-        do_unflatten(value, separator, recursive)
+        do_unflatten(value, separator, recursive, depth + keys.len())
     } else {
         value
     };
@@ -413,4 +432,66 @@ mod test {
             tdef: TypeDef::object(Collection::any()),
         }
     ];
+
+    #[test]
+    fn test_depth_limit_obe10744() {
+        // OBE-10744: unflatten with deeply grouped entries must terminate at MAX_UNFLATTEN_DEPTH.
+        // Build two entries sharing a 200-level common prefix ("k0.k1...k199.x" and "...y").
+        // Without the fix, do_unflatten_entries recurses 200 times and can stack overflow.
+        let prefix: Vec<String> = (0..200).map(|i| format!("k{i}")).collect();
+        let key1: KeyString = [prefix.join("."), "x".into()].join(".").into();
+        let key2: KeyString = [prefix.join("."), "y".into()].join(".").into();
+        let entries: Vec<(KeyString, Value)> = vec![(key1, Value::Integer(1)), (key2, Value::Integer(2))];
+        // Must return without panicking and depth must be bounded.
+        let result = do_unflatten_entries(entries, ".", false, 0);
+        // Walk result to verify nesting depth is bounded.
+        let mut depth = 0usize;
+        let mut cur = Value::Object(result);
+        loop {
+            match cur {
+                Value::Object(ref m) if m.len() == 1 => {
+                    cur = m.values().next().unwrap().clone();
+                    depth += 1;
+                    assert!(depth <= MAX_UNFLATTEN_DEPTH + 1, "nesting depth {depth} exceeds cap (OBE-10744)");
+                }
+                _ => break,
+            }
+        }
+    }
+
+    #[test]
+    fn test_unflatten_recursive_forwards_depth_obe10744() {
+        // OBE-10744 (reset-to-0 regression): `recursive: true` re-enters `do_unflatten` on every
+        // pre-existing nested `Value::Object`, not just on split dotted keys. If that re-entry
+        // resets depth to 0 instead of forwarding the accumulated depth, the cap never engages
+        // for plain nested objects, and a deeply pre-nested value still drives unbounded
+        // native-stack recursion.
+        //
+        // Build MAX_UNFLATTEN_DEPTH + 10 levels of single-key nested objects, with a dotted leaf
+        // key at the bottom. With depth correctly forwarded, recursion must stop once the cap is
+        // reached, leaving the leaf-most dotted key un-split.
+        let total_levels = MAX_UNFLATTEN_DEPTH + 10;
+        let mut value = value!({ "leaf.key": 1 });
+        for i in (0..total_levels).rev() {
+            value = Value::Object(ObjectMap::from_iter([(format!("l{i}").into(), value)]));
+        }
+
+        let result = do_unflatten(value, ".", true, 0);
+
+        let mut cur = &result;
+        for i in 0..total_levels {
+            let Value::Object(map) = cur else {
+                panic!("expected object at level {i}, got {cur:?}")
+            };
+            cur = map.values().next().expect("expected exactly one entry");
+        }
+        let Value::Object(leaf_map) = cur else {
+            panic!("expected leaf object, got {cur:?}")
+        };
+        assert!(
+            leaf_map.contains_key("leaf.key"),
+            "past the depth cap, dotted keys must remain un-split — recursion should have \
+             stopped instead of continuing to the leaf: {leaf_map:?}"
+        );
+    }
 }

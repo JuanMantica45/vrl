@@ -587,4 +587,20 @@ mod tests {
         assert!(object2.known().is_empty());
         assert!(object2.unknown_kind().is_any());
     }
+
+    #[test]
+    fn test_xml_depth_limit_obe10742() {
+        // OBE-10742: deeply nested XML from attacker-controlled input must be rejected.
+        // Without the fix, process_node recurses for every element level and can stack overflow.
+        let depth = 200usize;
+        let open: String = (0..depth).map(|i| format!("<a{i}>")).collect();
+        let close: String = (0..depth).rev().map(|i| format!("</a{i}>")).collect();
+        let xml = format!("{open}hi{close}");
+        let value = Value::Bytes(xml.into());
+        let options = crate::parsing::xml::ParseOptions::default();
+        let result = crate::parsing::xml::parse_xml(value, options);
+        assert!(result.is_err(), "XML with {depth} nesting levels must be rejected (OBE-10742)");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("nesting limit"), "error must mention nesting limit: {msg}");
+    }
 }

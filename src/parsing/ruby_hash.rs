@@ -12,8 +12,10 @@ use nom::{
 };
 use std::num::ParseIntError;
 
+const MAX_RUBY_HASH_DEPTH: usize = 128;
+
 pub(crate) fn parse_ruby_hash(input: &str) -> ExpressionResult<Value> {
-    let result = parse_hash(input)
+    let result = parse_hash(0)(input)
         .map_err(|err| match err {
             nom::Err::Error(err) | nom::Err::Failure(err) => {
                 // Create a descriptive error message if possible.
@@ -139,64 +141,84 @@ fn parse_key<'a, E: HashParseError<&'a str>>(input: &'a str) -> IResult<&'a str,
     ))(input)
 }
 
-fn parse_array<'a, E: HashParseError<&'a str>>(input: &'a str) -> IResult<&'a str, Value, E> {
-    context(
-        "array",
-        map(
-            preceded(
-                char('['),
-                cut(terminated(
-                    separated_list0(preceded(sp, char(',')), parse_value),
-                    preceded(sp, char(']')),
-                )),
+fn parse_array<'a, E: HashParseError<&'a str>>(
+    depth: usize,
+) -> impl FnMut(&'a str) -> IResult<&'a str, Value, E> {
+    move |input| {
+        context(
+            "array",
+            map(
+                preceded(
+                    char('['),
+                    cut(terminated(
+                        separated_list0(preceded(sp, char(',')), parse_value(depth + 1)),
+                        preceded(sp, char(']')),
+                    )),
+                ),
+                Value::Array,
             ),
-            Value::Array,
-        ),
-    )(input)
+        )(input)
+    }
 }
 
 fn parse_key_value<'a, E: HashParseError<&'a str>>(
-    input: &'a str,
-) -> IResult<&'a str, (KeyString, Value), E> {
-    separated_pair(
-        preceded(sp, parse_key),
-        cut(preceded(sp, alt((tag(":"), tag("=>"))))),
-        parse_value,
-    )(input)
+    depth: usize,
+) -> impl FnMut(&'a str) -> IResult<&'a str, (KeyString, Value), E> {
+    move |input| {
+        separated_pair(
+            preceded(sp, parse_key),
+            cut(preceded(sp, alt((tag(":"), tag("=>"))))),
+            parse_value(depth),
+        )(input)
+    }
 }
 
-fn parse_hash<'a, E: HashParseError<&'a str>>(input: &'a str) -> IResult<&'a str, Value, E> {
-    context(
-        "map",
-        map(
-            preceded(
-                char('{'),
-                cut(terminated(
-                    map(
-                        separated_list0(preceded(sp, char(',')), parse_key_value),
-                        |tuple_vec| tuple_vec.into_iter().collect(),
-                    ),
-                    preceded(sp, char('}')),
-                )),
+fn parse_hash<'a, E: HashParseError<&'a str>>(
+    depth: usize,
+) -> impl FnMut(&'a str) -> IResult<&'a str, Value, E> {
+    move |input| {
+        context(
+            "map",
+            map(
+                preceded(
+                    char('{'),
+                    cut(terminated(
+                        map(
+                            separated_list0(preceded(sp, char(',')), parse_key_value(depth + 1)),
+                            |tuple_vec| tuple_vec.into_iter().collect(),
+                        ),
+                        preceded(sp, char('}')),
+                    )),
+                ),
+                Value::Object,
             ),
-            Value::Object,
-        ),
-    )(input)
+        )(input)
+    }
 }
 
-fn parse_value<'a, E: HashParseError<&'a str>>(input: &'a str) -> IResult<&'a str, Value, E> {
-    preceded(
-        sp,
-        alt((
-            parse_nil,
-            parse_hash,
-            parse_array,
-            map(parse_colon_key, Value::from),
-            map(parse_bytes, Value::Bytes),
-            map(double, |value| Value::Float(NotNan::new(value).unwrap())),
-            map(parse_boolean, Value::Boolean),
-        )),
-    )(input)
+fn parse_value<'a, E: HashParseError<&'a str>>(
+    depth: usize,
+) -> impl FnMut(&'a str) -> IResult<&'a str, Value, E> {
+    move |input| {
+        if depth > MAX_RUBY_HASH_DEPTH {
+            return Err(nom::Err::Failure(E::from_error_kind(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            )));
+        }
+        preceded(
+            sp,
+            alt((
+                parse_nil,
+                parse_hash(depth),
+                parse_array(depth),
+                map(parse_colon_key, Value::from),
+                map(parse_bytes, Value::Bytes),
+                map(double, |value| Value::Float(NotNan::new(value).unwrap())),
+                map(parse_boolean, Value::Boolean),
+            )),
+        )(input)
+    }
 }
 
 #[cfg(test)]
@@ -338,5 +360,17 @@ mod tests {
     #[test]
     fn test_non_hash() {
         assert!(parse_ruby_hash(r#""hello world""#).is_err());
+    }
+
+    #[test]
+    fn test_depth_limit_obe10741() {
+        // OBE-10741: deeply nested ruby hash from attacker-controlled input must be rejected.
+        // Without the fix, parsing 200 levels of nesting recurses through parse_value/parse_hash
+        // and can cause stack overflow or DoS.
+        let open: String = "{:k => ".repeat(200);
+        let close: String = "}".repeat(200);
+        let input = format!("{open}1{close}");
+        let result = parse_ruby_hash(&input);
+        assert!(result.is_err(), "hash with 200 nesting levels must be rejected (OBE-10741)");
     }
 }
