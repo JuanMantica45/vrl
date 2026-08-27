@@ -1,0 +1,14 @@
+# issue: OBE-10735
+# Assigning to a large array index pads the array with `Value::Null` up to that index. The padding
+# is observable semantics (`length` sees it), so the write genuinely commits `index + 1` elements —
+# an event-controlled index was enough to exhaust memory. Indices beyond +/-1048576 (2^20) are now
+# dropped. 2^20 bounds one indexed write to ~42 MB at today's 40-byte `Value`.
+# result: [0, 1048577]
+
+capped = []
+capped[2000000] = 1
+
+allowed = []
+allowed[1048576] = 1
+
+[length(capped), length(allowed)]

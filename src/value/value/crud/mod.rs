@@ -1,9 +1,13 @@
 use crate::value::{KeyString, ObjectMap, Value};
 use std::borrow::Borrow;
 
-/// Largest array index `insert_value` will grow an array to, in either direction.
+/// Largest array index an indexed write will grow an array to, in either direction.
 /// Prevents an event-controlled index (e.g. `.foo[40000000] = 1`) from exhausting memory.
-const MAX_ARRAY_INDEX: usize = 32_768;
+///
+/// Assigning to index `N` materialises `N + 1` elements — the null padding is observable VRL
+/// semantics, not just a preallocation — so this cap is what bounds the memory a single write may
+/// commit: ~42 MB at today's 40-byte `Value` (see `test_value_size_is_pinned`).
+pub(super) const MAX_ARRAY_INDEX: usize = 1_048_576;
 
 mod get;
 mod get_mut;
