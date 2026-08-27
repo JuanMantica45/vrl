@@ -33,6 +33,12 @@ use tracing::warn;
 const SIDE_EFFECT_FUNCTIONS: [&str; 5] =
     ["del", "log", "assert", "assert_eq", "set_semantic_meaning"];
 
+/// Fraction of the stack available when the walk starts that it will not descend into. Like the
+/// compiler's guard this is a fraction rather than a byte count: a fixed reserve lets a cheap
+/// per-level walk descend until only that fixed amount remains, which is then too little for
+/// whatever it calls at the bottom.
+const VISITOR_STACK_RESERVE_FRACTION: usize = 2;
+
 #[must_use]
 pub fn check_for_unused_results(ast: &Program) -> DiagnosticList {
     let expression_visitor = AstVisitor { ast };
@@ -58,6 +64,10 @@ struct VisitorState {
     ident_to_state: BTreeMap<Ident, IdentState>,
     visiting_closure: bool,
     diagnostics: DiagnosticList,
+
+    /// Stack level below which `visit_node` stops descending. `None` where the platform cannot
+    /// report remaining stack, in which case the walk behaves as it always has.
+    stack_floor: Option<usize>,
 }
 
 impl VisitorState {
@@ -190,6 +200,17 @@ fn scoped_visit(state: &mut VisitorState, f: impl FnOnce(&mut VisitorState)) {
 
 impl AstVisitor<'_> {
     fn visit_node(&self, node: &Node<Expr>, state: &mut VisitorState) {
+        // OBE-10738: this walk recurses once per expression-nesting level, on the raw AST and
+        // before the compiler's own guard can apply. It only produces advisory warnings, so when
+        // the stack runs short the correct move is to stop descending rather than to fail — a
+        // deeply-nested program is about to be rejected by the compiler anyway, and losing
+        // unused-expression warnings for its deepest nodes costs nothing.
+        if let (Some(remaining), Some(floor)) = (stacker::remaining_stack(), state.stack_floor) {
+            if remaining < floor {
+                return;
+            }
+        }
+
         let expression = node.inner();
 
         match expression {
@@ -412,7 +433,10 @@ impl AstVisitor<'_> {
     /// * Unused Expressions: an expression without side-effects with an unused result
     fn check_for_unused_results(&self) -> DiagnosticList {
         let mut unused_warnings = DiagnosticList::default();
-        let mut state = VisitorState::default();
+        let mut state = VisitorState {
+            stack_floor: stacker::remaining_stack().map(|r| r / VISITOR_STACK_RESERVE_FRACTION),
+            ..VisitorState::default()
+        };
         let root_expressions = &self.ast.0;
         for (i, root_node) in root_expressions.iter().enumerate() {
             let is_last = i == root_expressions.len() - 1;

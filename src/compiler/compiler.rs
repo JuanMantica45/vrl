@@ -56,6 +56,10 @@ pub struct Compiler<'a> {
     // the error from the LHS)
     fallible_expression_error: Option<CompilerError>,
 
+    /// Stack level below which `compile_expr` stops recursing, computed once from the stack
+    /// available when compilation started. `None` where the platform cannot report it.
+    stack_floor: Option<usize>,
+
     config: CompileConfig,
 }
 
@@ -65,6 +69,41 @@ pub struct Compiler<'a> {
 pub(crate) enum CompilerError {
     FunctionCallError(FunctionCallError),
     ExpressionError(ExpressionError),
+}
+
+/// Fraction of the stack available when compilation starts that is held back for the work still
+/// owed once the guard fires: `Expr::type_info`'s walk back over the compiled subtree, and
+/// unwinding.
+///
+/// This is a *fraction*, not a byte count, because the reserve has to scale. `type_info` recurses
+/// over the subtree built so far, so the deeper we let compilation go, the more stack the unwind
+/// needs — and how deep we let it go is itself a function of the stack we started with. A fixed
+/// byte reserve is therefore wrong at some stack size by construction: tuned for a 2 MiB release
+/// build it overflows a debug build, whose frames are several times fatter.
+///
+/// Reserving half is what measurement supports: compilation costs ~5,030 bytes per nesting level in
+/// release and ~10,850 in debug (measured), and `type_info`'s walk back over the compiled subtree is a
+/// large enough share of that per-level cost that a quarter proved insufficient in debug builds.
+const STACK_RESERVE_FRACTION: usize = 2;
+
+/// A program nested deeply enough that compiling it would overflow the native stack.
+///
+/// This is not a fixed nesting limit. How deeply a program may nest depends on the stack of the
+/// thread compiling it, so the same program can be valid on one thread and rejected on another.
+#[derive(Debug, thiserror::Error)]
+#[error("recursion limit reached: not enough stack remaining to compile this level of expression nesting")]
+pub(crate) struct StackExhaustionError;
+
+impl DiagnosticMessage for StackExhaustionError {
+    fn code(&self) -> usize {
+        670
+    }
+
+    fn notes(&self) -> Vec<Note> {
+        vec![Note::Basic(
+            "reduce the nesting depth of this expression".to_owned(),
+        )]
+    }
 }
 
 impl CompilerError {
@@ -102,6 +141,7 @@ impl<'a> Compiler<'a> {
             external_assignments: vec![],
             skip_missing_query_target: vec![],
             fallible_expression_error: None,
+            stack_floor: stacker::remaining_stack().map(|r| r / STACK_RESERVE_FRACTION),
             config,
         };
         let expressions = compiler.compile_root_exprs(ast, &mut state);
@@ -153,6 +193,21 @@ impl<'a> Compiler<'a> {
             Abort, Assignment, Container, FunctionCall, IfStatement, Literal, Op, Query, Return,
             Unary, Variable,
         };
+
+        // OBE-10738/OBE-10740: this function recurses once per expression-nesting level, so a
+        // crafted program can drive the native stack into its guard page — a SIGSEGV, not a
+        // catchable panic. Stop while there is still stack to fail gracefully in.
+        //
+        // `remaining_stack()` returns `None` where the platform cannot determine the bound; treat
+        // that as "proceed" so such platforms keep today's behaviour rather than rejecting
+        // everything. A program rejected here also never reaches `Expr::resolve`, whose recursion
+        // follows the same nesting (OBE-10740).
+        if let (Some(remaining), Some(floor)) = (stacker::remaining_stack(), self.stack_floor) {
+            if remaining < floor {
+                self.diagnostics.push(Box::new(StackExhaustionError));
+                return None;
+            }
+        }
         let original_state = state.clone();
 
         let span = node.span();
@@ -850,5 +905,61 @@ impl<'a> Compiler<'a> {
         };
 
         self.skip_missing_query_target.push(query);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Compiles `!!!…!true` at `depth` on a thread with exactly `stack` bytes.
+    /// Returns `Ok(())` if it compiled, `Err(())` if it was rejected with a diagnostic.
+    /// A stack overflow aborts the process instead of returning — which is the point.
+    fn compile_at(depth: usize, stack: usize) -> Result<(), ()> {
+        let src = "!".repeat(depth) + "true";
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(move || {
+                let fns = crate::stdlib::all();
+                crate::compiler::compile(&src, &fns)
+                    .map(|_| ())
+                    .map_err(|_| ())
+            })
+            .expect("spawn")
+            .join()
+            .expect("join")
+    }
+
+    // OBE-10738: before the guard, this aborted the process — compilation costs ~5,030 bytes of
+    // stack per nesting level, so 1,000 levels needs ~5 MB and a 2 MiB thread cannot hold it.
+    #[test]
+    fn rejects_nesting_that_would_exhaust_the_stack() {
+        assert!(
+            compile_at(1_000, 2 * 1024 * 1024).is_err(),
+            "expected a diagnostic, not a compiled program"
+        );
+    }
+
+    // The other half of the pair, and the reason this is a headroom guard rather than a fixed
+    // depth cap: the *same* program is legitimate given a bigger stack. A `MAX_EXPR_DEPTH = 128`
+    // implementation fails this test.
+    #[test]
+    fn compiles_the_same_program_given_a_larger_stack() {
+        assert!(
+            compile_at(1_000, 32 * 1024 * 1024).is_ok(),
+            "expected the program to compile with ample stack"
+        );
+    }
+
+    // A fixed cap of 128 would also have been unsafe in the other direction: a 512 KiB thread
+    // holds only ~104 levels. The guard adapts instead of rejecting or overflowing.
+    #[test]
+    fn adapts_to_a_small_stack() {
+        assert!(compile_at(200, 512 * 1024).is_err());
+        assert!(compile_at(20, 512 * 1024).is_ok());
+    }
+
+    // Ordinary programs must be unaffected on the 2 MiB stack tokio gives its workers.
+    #[test]
+    fn leaves_ordinary_nesting_alone() {
+        assert!(compile_at(64, 2 * 1024 * 1024).is_ok());
     }
 }
