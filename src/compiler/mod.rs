@@ -56,6 +56,8 @@ pub use self::deprecation_warning::DeprecationWarning;
 #[allow(clippy::module_inception)]
 mod compiler;
 
+mod ast_teardown;
+
 mod compile_config;
 mod context;
 mod datetime;

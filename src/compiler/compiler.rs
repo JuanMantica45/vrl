@@ -205,6 +205,10 @@ impl<'a> Compiler<'a> {
         if let (Some(remaining), Some(floor)) = (stacker::remaining_stack(), self.stack_floor) {
             if remaining < floor {
                 self.diagnostics.push(Box::new(StackExhaustionError));
+                // We still own everything below this point. Dropping it normally would run the
+                // derived drop glue, which recurses per nesting level and would overflow the very
+                // stack this guard just protected — so unwind it against a heap worklist instead.
+                super::ast_teardown::drop_expr(node);
                 return None;
             }
         }
@@ -955,6 +959,17 @@ mod tests {
     fn adapts_to_a_small_stack() {
         assert!(compile_at(200, 512 * 1024).is_err());
         assert!(compile_at(20, 512 * 1024).is_ok());
+    }
+
+    // The guard bails while still holding the entire un-compiled remainder of the program.
+    // Dropping that with the derived glue is what used to kill the process *after* the guard had
+    // correctly fired, because it costs stack proportional to the program's depth rather than to
+    // where compilation stopped. Tearing it down iteratively is therefore load-bearing, and this
+    // must hold at any depth whatsoever.
+    #[test]
+    fn rejects_pathological_nesting_without_dying_in_cleanup() {
+        assert!(compile_at(50_000, 2 * 1024 * 1024).is_err());
+        assert!(compile_at(50_000, 512 * 1024).is_err());
     }
 
     // Ordinary programs must be unaffected on the 2 MiB stack tokio gives its workers.
