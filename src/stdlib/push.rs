@@ -1,6 +1,19 @@
 use crate::compiler::prelude::*;
+use crate::value::depth::{depth_exceeds, MAX_VALUE_DEPTH};
 
 fn push(list: Value, item: Value) -> Resolved {
+    // OBE-10732: `v = push([], v)` inside a loop grows nesting one level per iteration, which is
+    // how a VRL program builds a `Value` deep enough to overflow the stack in `Clone`, `PartialEq`
+    // or `Display`. None of those can return an error, so the only place to stop it is before the
+    // value is built. The item lands one level below the resulting array, so it may be at most
+    // `MAX_VALUE_DEPTH - 1` deep.
+    if depth_exceeds(&item, MAX_VALUE_DEPTH - 1) {
+        return Err(format!(
+            "cannot push: the result would nest deeper than the limit of {MAX_VALUE_DEPTH}"
+        )
+        .into());
+    }
+
     let mut list = list.try_array()?;
     list.push(item);
     Ok(list.into())
@@ -128,4 +141,48 @@ mod tests {
             }),
         }
     ];
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+    use crate::value::depth::MAX_VALUE_DEPTH;
+
+    /// Builds a `Value` nested `depth` levels. Iterative, so building it costs no stack —
+    /// which is the whole reason a deep `Value` is reachable from VRL in the first place.
+    /// A `Value` nested exactly `depth` levels: `nested(1)` is a scalar, `nested(2)` is `[scalar]`.
+    fn nested(depth: usize) -> Value {
+        let mut v = Value::Null;
+        for _ in 1..depth {
+            v = Value::Array(vec![v]);
+        }
+        v
+    }
+
+    // OBE-10732: `v = push([], v)` in a loop grows nesting one level per iteration, with no cap.
+    // Past a few thousand levels the resulting `Value` crashes the process in `PartialEq`, `Clone`
+    // or `Display` — none of which can report an error — so the only place to stop it is here.
+    #[test]
+    fn push_rejects_an_item_that_would_exceed_the_depth_cap() {
+        let item = nested(MAX_VALUE_DEPTH);
+        assert!(
+            push(Value::Array(vec![]), item).is_err(),
+            "expected an error once the result would exceed MAX_VALUE_DEPTH"
+        );
+    }
+
+    #[test]
+    fn push_accepts_an_item_at_the_boundary() {
+        let item = nested(MAX_VALUE_DEPTH - 1);
+        assert!(
+            push(Value::Array(vec![]), item).is_ok(),
+            "expected a value landing exactly at MAX_VALUE_DEPTH to be accepted"
+        );
+    }
+
+    #[test]
+    fn push_leaves_ordinary_values_alone() {
+        assert!(push(Value::Array(vec![]), Value::Integer(1)).is_ok());
+        assert!(push(Value::Array(vec![]), nested(8)).is_ok());
+    }
 }

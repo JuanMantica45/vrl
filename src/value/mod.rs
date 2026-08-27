@@ -40,6 +40,7 @@ pub mod secrets;
 pub mod value;
 
 mod btreemap;
+pub(crate) mod depth;
 mod keystring;
 
 pub use kind::Kind;
