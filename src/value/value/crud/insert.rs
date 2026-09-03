@@ -1,4 +1,4 @@
-use super::{ValueCollection, MAX_ARRAY_INDEX};
+use super::ValueCollection;
 use crate::path::BorrowedSegment;
 use crate::value::Value;
 use std::borrow::Borrow;
@@ -26,16 +26,13 @@ pub fn insert<'a, T: ValueCollection>(
             if let Some(Value::Array(array)) = value.get_mut_value(key.borrow()) {
                 insert(array, index, path_iter, insert_value)
             } else {
-                // Bounded by the same cap `insert_value` enforces, so an out-of-range index
-                // cannot reserve memory here before being rejected there.
-                let max_capacity = MAX_ARRAY_INDEX + 1;
-                let capacity = if index >= 0 {
-                    ((index as usize) + 1).min(max_capacity)
-                } else {
-                    // `unsigned_abs` rather than `-index`, which overflows on `isize::MIN`.
-                    index.unsigned_abs().min(max_capacity)
-                };
-                let mut array = Vec::with_capacity(capacity);
+                // No preallocation here: `insert_value` (for `Vec<Value>`) checks the index
+                // against `MAX_ARRAY_INDEX` before doing any allocation, so an out-of-range
+                // index is rejected with zero large allocation. For an in-range index it does
+                // its own correctly-sized allocation (a growth loop for positive indices, a
+                // `with_capacity` for negative ones) — preallocating here duplicated or wasted
+                // that work.
+                let mut array = Vec::new();
                 let prev_value = insert(&mut array, index, path_iter, insert_value);
                 value.insert_value(key, Value::Array(array));
                 prev_value
@@ -96,6 +93,17 @@ mod test {
         let mut value = Value::Null;
         assert_eq!(value.insert("[-1048577]", 1), None);
         assert_eq!(value, Value::from(json!([])));
+    }
+
+    // OBE-10735: `insert` used to speculatively `Vec::with_capacity` the (clamped) index before
+    // `insert_value` had a chance to reject an out-of-range write, so a rejected huge index still
+    // committed a large (~42 MB) allocation. Assert the rejected array stays unallocated.
+    #[test]
+    fn test_insert_beyond_max_array_index_does_not_preallocate() {
+        let mut value = Value::Null;
+        assert_eq!(value.insert("[2000000]", 1), None);
+        let array = value.as_array_mut().expect("expected an array");
+        assert_eq!(array.capacity(), 0);
     }
 
     #[test]
