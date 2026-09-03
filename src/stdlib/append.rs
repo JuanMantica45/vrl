@@ -1,8 +1,23 @@
 use crate::compiler::prelude::*;
+use crate::value::depth::{depth_exceeds, MAX_VALUE_DEPTH};
 
 fn append(value: Value, items: Value) -> Resolved {
     let mut value = value.try_array()?;
     let mut items = items.try_array()?;
+
+    // OBE-10732: same reasoning as `push` — every element of both arrays becomes a direct child
+    // of the result, so each is checked.
+    if value
+        .iter()
+        .chain(items.iter())
+        .any(|item| depth_exceeds(item, MAX_VALUE_DEPTH - 1))
+    {
+        return Err(format!(
+            "cannot append: the result would nest deeper than the limit of {MAX_VALUE_DEPTH}"
+        )
+        .into());
+    }
+
     value.append(&mut items);
     Ok(value.into())
 }
@@ -141,4 +156,39 @@ mod tests {
             }),
         }
     ];
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    /// A `Value` nested exactly `depth` levels: `nested(1)` is a scalar, `nested(2)` is `[scalar]`.
+    fn nested(depth: usize) -> Value {
+        let mut v = Value::Null;
+        for _ in 1..depth {
+            v = Value::Array(vec![v]);
+        }
+        v
+    }
+
+    #[test]
+    fn append_rejects_only_past_the_depth_cap() {
+        let boundary = Value::Array(vec![nested(MAX_VALUE_DEPTH - 1)]);
+        let over = Value::Array(vec![nested(MAX_VALUE_DEPTH)]);
+        assert!(append(Value::Array(vec![]), boundary).is_ok());
+        assert!(append(Value::Array(vec![]), over).is_err());
+    }
+
+    // The type error is more fundamental, so it must win when both are wrong.
+    #[test]
+    fn append_reports_the_type_error_before_the_depth_error() {
+        let too_deep_items = Value::Array(vec![nested(MAX_VALUE_DEPTH)]);
+        let err = append(Value::Integer(1), too_deep_items)
+            .expect_err("expected an error")
+            .to_string();
+        assert!(
+            !err.contains("nest deeper"),
+            "expected the try_array type error, got the depth error instead: {err}"
+        );
+    }
 }

@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt, ops::Deref};
 
+use crate::value::depth::{depth_exceeds, MAX_VALUE_DEPTH};
 use crate::value::{KeyString, Value};
 use crate::{
     compiler::{
@@ -30,13 +31,34 @@ impl Deref for Object {
     }
 }
 
+// OBE-10732: `v = { "a": v }` in a loop grows nesting one level per iteration. Same tradeoff as
+// the array literal cap in `array.rs`: an over-limit field value is dropped and logged.
+fn cap_depth(fields: BTreeMap<KeyString, Value>) -> BTreeMap<KeyString, Value> {
+    fields
+        .into_iter()
+        .map(|(key, value)| {
+            if depth_exceeds(&value, MAX_VALUE_DEPTH - 1) {
+                tracing::warn!(
+                    max_depth = MAX_VALUE_DEPTH,
+                    "object literal field exceeds max value depth, replaced with null"
+                );
+                (key, Value::Null)
+            } else {
+                (key, value)
+            }
+        })
+        .collect()
+}
+
 impl Expression for Object {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
-        self.inner
+        let fields: BTreeMap<_, _> = self
+            .inner
             .iter()
             .map(|(key, expr)| expr.resolve(ctx).map(|v| (key.clone(), v)))
-            .collect::<Result<BTreeMap<_, _>, _>>()
-            .map(Value::Object)
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+        Ok(Value::Object(cap_depth(fields)))
     }
 
     fn resolve_constant(&self, state: &TypeState) -> Option<Value> {
@@ -100,5 +122,34 @@ impl fmt::Display for Object {
 impl From<BTreeMap<KeyString, Expr>> for Object {
     fn from(inner: BTreeMap<KeyString, Expr>) -> Self {
         Self { inner }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Value` nested exactly `depth` levels: `nested(1)` is a scalar, `nested(2)` is `[scalar]`.
+    fn nested(depth: usize) -> Value {
+        let mut v = Value::Null;
+        for _ in 1..depth {
+            v = Value::Array(vec![v]);
+        }
+        v
+    }
+
+    // OBE-10732: an over-limit field is dropped, the boundary and ordinary fields are untouched.
+    #[test]
+    fn cap_depth_drops_only_the_over_limit_field() {
+        let at_boundary = nested(MAX_VALUE_DEPTH - 1);
+        let fields = BTreeMap::from([
+            (KeyString::from("a"), Value::Integer(1)),
+            (KeyString::from("b"), at_boundary.clone()),
+            (KeyString::from("c"), nested(MAX_VALUE_DEPTH)),
+        ]);
+        let capped = cap_depth(fields);
+        assert_eq!(capped[&KeyString::from("a")], Value::Integer(1));
+        assert_eq!(capped[&KeyString::from("b")], at_boundary);
+        assert_eq!(capped[&KeyString::from("c")], Value::Null);
     }
 }

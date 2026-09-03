@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt, ops::Deref};
 
+use crate::value::depth::{depth_exceeds, MAX_VALUE_DEPTH};
 use crate::value::Value;
 use crate::{
     compiler::{
@@ -29,13 +30,35 @@ impl Deref for Array {
     }
 }
 
+// OBE-10732: `v = [v]` in a loop grows nesting one level per iteration, same shape `push` closed.
+// Literal syntax can't be made fallible without breaking every array literal in existence, so —
+// as with the array-index cap in `crud/mod.rs` — an over-limit item is dropped and logged instead.
+fn cap_depth(items: Vec<Value>) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|item| {
+            if depth_exceeds(&item, MAX_VALUE_DEPTH - 1) {
+                tracing::warn!(
+                    max_depth = MAX_VALUE_DEPTH,
+                    "array literal element exceeds max value depth, replaced with null"
+                );
+                Value::Null
+            } else {
+                item
+            }
+        })
+        .collect()
+}
+
 impl Expression for Array {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
-        self.inner
+        let items = self
+            .inner
             .iter()
             .map(|expr| expr.resolve(ctx))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Value::Array(cap_depth(items)))
     }
 
     fn resolve_constant(&self, state: &TypeState) -> Option<Value> {
@@ -139,4 +162,28 @@ mod tests {
             ])),
         }
     ];
+
+    /// A `Value` nested exactly `depth` levels: `nested(1)` is a scalar, `nested(2)` is `[scalar]`.
+    fn nested(depth: usize) -> Value {
+        let mut v = Value::Null;
+        for _ in 1..depth {
+            v = Value::Array(vec![v]);
+        }
+        v
+    }
+
+    // OBE-10732: an over-limit item is dropped, the boundary and ordinary items are untouched.
+    #[test]
+    fn cap_depth_drops_only_the_over_limit_item() {
+        let at_boundary = nested(MAX_VALUE_DEPTH - 1);
+        let items = vec![
+            Value::Integer(1),
+            at_boundary.clone(),
+            nested(MAX_VALUE_DEPTH),
+        ];
+        assert_eq!(
+            cap_depth(items),
+            vec![Value::Integer(1), at_boundary, Value::Null]
+        );
+    }
 }
